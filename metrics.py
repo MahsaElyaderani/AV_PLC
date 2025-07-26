@@ -11,9 +11,9 @@ from jiwer import wer
 from speechmos import plcmos
 from editdistance import eval as edit_eval
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
-from stable_diffusion.dataset.hifigan.hifigan.generator import HifiganGenerator
-from stable_diffusion.models.plc.audio_processing import torch_mel2audio
-from stable_diffusion.dataset.audio_processing import inv_spectrogram, inv_melspectrogram
+from hifigan.hifigan.generator import HifiganGenerator
+from audio_processing import torch_mel2audio
+from audio_processing import inv_spectrogram, inv_melspectrogram
 
 
 class Vocoder:

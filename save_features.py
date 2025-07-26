@@ -28,14 +28,14 @@ from resemblyzer import VoiceEncoder, preprocess_wav
 import mediapipe
 from mediapipe.python.solutions.face_mesh_connections import FACEMESH_LIPS
 
-from stable_diffusion.dataset.text_processing import  CTCTokenizer
-from stable_diffusion.dataset.masking import GilbertElliottModel
+from text_processing import  CTCTokenizer
+from masking import GilbertElliottModel
 
 
 LANDMARK_DIM = 478
 SR = 16000
 FPS = 25.0
-DURATION_SEC = 2.0
+DURATION_SEC = 3.0
 lip_indices = sorted(set(i for connection in FACEMESH_LIPS for i in connection))
 
 def init_worker():
@@ -113,15 +113,22 @@ def curr_read_video(filename):
             return None
     else:
         audio = audio[0]
-
+    audio = torch.from_numpy(audio)
     # Truncate audio and video
     audio_len = int(DURATION_SEC * SR)
-    video_len = int(DURATION_SEC * video_fps)
+    #video_len = int(DURATION_SEC * FPS)
+
+    if audio_len > audio.size(0):
+        audio = torch.nn.functional.pad(audio, (0, audio_len - audio.size(0)), 'constant')
+
+    elif audio_len < audio.size(0):
+        audio = audio[:audio_len]
+
 
     audio = audio[: audio_len]
-    video = video[: video_len]
+    #video = video[: video_len]
 
-    return video, torch.from_numpy(audio), info
+    return video, audio, info
 
 
 
@@ -349,6 +356,7 @@ def write_h5(output_file, results, start_index, mode):
             h5f.create_dataset(f"{video_key}/landmarks", data=result["landmarks"], compression="gzip")
             h5f.create_dataset(f"{video_key}/mel_spec", data=result["mel_spec"], compression="gzip")
             h5f.create_dataset(f"{video_key}/text", data=result["text"], compression="gzip")
+            h5f.create_dataset(f"{video_key}/spkr_embd", data=result["spkr_embd"], compression="gzip")
             h5f.create_dataset(f"{video_key}/mask", data=result["mask"], compression="gzip")
             h5f.attrs[f"{video_key}/video_path"] = result["video_path"]
 
@@ -398,10 +406,10 @@ if __name__ == "__main__":
     splits = {"test", "val", "train"}
 
     for split in splits:
-        path = f'/home/ai/Projects/Mahsa/datasets/vox2_short/vox2_{split}_mp4/'
-        video_list = glob.glob(os.path.join(path, '*/*/*.mp4'))
+        path = f'datasets/{split}/'
+        video_list = glob.glob(os.path.join(path, 's*/*.mpg'))
 
-        feats_filename = f'/home/ai/Projects/Mahsa/datasets/vox2_short/vox2_short_{split}_features.h5'
+        feats_filename = f'datasets/grid_{split}_features.h5'
         extract_features_parallel(video_list, feats_filename)
 
 

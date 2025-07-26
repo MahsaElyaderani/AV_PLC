@@ -6,8 +6,8 @@ import torchvision
 from PIL import Image
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
-from stable_diffusion.dataset.utils import visualize_motion
-from stable_diffusion.dataset.av_augmentation import VideoAugmentations, SpectrogramAugmentations, ModalityDropout
+from utils import visualize_motion
+from av_augmentation import VideoAugmentations, SpectrogramAugmentations, ModalityDropout
 
 """Eager conversion to Torch means converting to Torch Tensor in __getitem__ that is
  not good for large data. Lazy conversion returns numpy then batch and convert → much safer."""
@@ -92,7 +92,7 @@ class AVDataset(Dataset):
         h5f = self._get_h5_file(chunk_idx)
 
         text = h5f[f"{video_key}/text"][:]
-        mel_spec = h5f[f"{video_key}/spec"][:]
+        mel_spec = h5f[f"{video_key}/mel_spec"][:]
         video_path = h5f.attrs.get(f"{video_key}/video_path", None)
 
         if self.mask_range == 'rand':
@@ -145,17 +145,32 @@ class AVDataset(Dataset):
             #         return masked_spec, frames, mel_spec, text, mask
             # else:
             #     frames = h5f[f"{video_key}/frames"][:]
-            frames = h5f[f"{video_key}/frames"][:50]
-            spk_emb = h5f[f"{video_key}/spkr_embed"][:]
 
+            frames = h5f[f"{video_key}/frames"][:]
+            spk_emb = h5f[f"{video_key}/spkr_embd"][:]
+
+            # Discard all-zero frames: shape [T, H, W, C]
+            video_mask = np.any(frames != 0, axis=(1, 2, 3))  # shape [T]
+            frames = frames[video_mask]
+
+            # Apply transform to each frame (convert from NumPy to PIL or tensor first)
+            # Assuming frames shape is (T, H, W, C) — e.g., RGB video
             processed_frames = []
             for frame in frames:
-                # NumPy to PIL for torchvision transforms
-                pil_frame = Image.fromarray(frame.astype(np.uint8))
+                # Convert from NumPy to PIL for torchvision transforms (Resize, Grayscale, etc.)
+                pil_frame = Image.fromarray(frame.astype(np.uint8))  # Use fromarray safely
                 transformed = self.video_transform(pil_frame)
                 processed_frames.append(transformed)
 
-            frames_tensor = torch.stack(processed_frames) # shape: (T, C, H, W)
+            # Stack into a Tensor: shape (T, C, H, W)
+            frames_tensor = torch.stack(processed_frames)
+            frames_tensor = frames_tensor.permute(1, 0, 2, 3).unsqueeze(0)  # [c, t_v, h, w]
+            if frames_tensor.shape[0] < 75:
+                H, W = frames_tensor.shape[-2], frames_tensor.shape[-1]
+                frames_tensor = torch.nn.functional.interpolate(frames_tensor, size=(75, H, W),
+                                              mode='trilinear', align_corners=False)
+                frames_tensor = frames_tensor.squeeze(0).permute(1, 0, 2, 3)
+
 
             return frames_tensor, torch.tensor(spk_emb), masked_spec, mel_spec, mask
 
@@ -163,23 +178,20 @@ class AVDataset(Dataset):
 
 if __name__ == "__main__":
 
-    from stable_diffusion.dataset.text_processing import CTCTokenizer
-    tokenizer = CTCTokenizer()
+
     # base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
     # path = base_path + 'vox2_short_test_features_chunk*.h5'
 
-    base_path = '/home/ai/Projects/Mahsa/datasets/grid/'
+    base_path = 'datasets/grid/'
     path = base_path + 'grid_test_features_chunk*.h5'
 
     dataset = AVDataset(path, mode='v', mask_range='60')
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
     print(len(dataloader))
-    for masked_spec, frames, mel_spec, text, mask in dataloader:
-    #     print(frames.shape)
-        #print(tokenizer.decode_greedy_batch(text))
-        #plt.imshow(frames[0,0,...]/255.)
-        #print(masked_spec[13].shape)
-        #plt.imshow(masked_spec[13])
+    for frames, spk_emb, masked_spec, mel_spec, mask in dataloader:
+        print(frames.shape)
+        print(masked_spec[13].shape)
+        plt.imshow(masked_spec[13])
         plt.imshow(frames[0, 30, ...] / 255.)
         plt.show()
 

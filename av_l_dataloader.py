@@ -1,7 +1,7 @@
 import os
 import torch
 from torch.utils.data import DataLoader, Subset
-from stable_diffusion.models.plc.av_l_dataset import AVDataset
+from av_l_dataset import AVDataset
 
 class AVDataloader:
     def __init__(self, dataset_name, mode, batch_size, num_workers,
@@ -10,19 +10,17 @@ class AVDataloader:
         assert dataset_name in ['grid', 'voxceleb2'], f"Invalid dataset_name: {dataset_name}"
 
         if dataset_name == 'grid':
-            base_path = '/home/ai/Projects/Mahsa/datasets/grid/'
+            base_path = 'datasets/grid/'
             self.train_files = base_path + 'grid_train_features_chunk*.h5'
             self.val_files = base_path + 'grid_val_features_chunk*.h5'
             self.test_files = base_path + 'grid_test_features_chunk*.h5'
 
         elif dataset_name == 'voxceleb2':
-            base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
+            base_path = 'datasets/vox2_short/'
             self.train_files = base_path + 'vox2_short_dev_features_chunk*.h5'
             self.val_files = base_path + 'vox2_short_val_features_chunk*.h5'
             self.test_files = base_path + 'vox2_short_test_features_chunk*.h5'
-            # train_files = base_path + 'vox2_short_train_features.h5'
-            # val_files = base_path + 'vox2_short_test_features.h5'
-            # test_files = base_path + 'vox2_short_test_features.h5'
+
 
         self.mode = mode
 

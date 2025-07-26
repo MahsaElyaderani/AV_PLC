@@ -21,9 +21,9 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
-from stable_diffusion.models.plc.metrics import Vocoder, torch_mel_to_audio
-from stable_diffusion.models.plc.metrics import calculate_batch_metrics, calculate_metrics
-from stable_diffusion.models.plc.losses import SingleSrcPMSQE, MaskedLoss, MSELoss, SVTS_Loss
+from metrics import Vocoder, torch_mel_to_audio
+from metrics import calculate_batch_metrics, calculate_metrics
+from losses import SingleSrcPMSQE, MaskedLoss, MSELoss, SVTS_Loss
 
 
 def setup_logging(model_name, log_dir='logs'):

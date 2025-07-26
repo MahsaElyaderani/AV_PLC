@@ -15,7 +15,7 @@ from typing import Tuple, List
 from resemblyzer import VoiceEncoder, preprocess_wav
 from mediapipe.python.solutions.face_mesh_connections import FACEMESH_LIPS
 
-from stable_diffusion.models.plc.masking import GilbertElliottModel
+from masking import GilbertElliottModel
 
 """
 This Dataset reads the videos directly in every call and crop video frames. 

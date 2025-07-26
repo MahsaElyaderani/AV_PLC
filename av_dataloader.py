@@ -2,7 +2,7 @@ import os
 import torch
 import glob
 from torch.utils.data import DataLoader, Subset
-from stable_diffusion.models.plc.av_dataset import AV_Dataset
+from av_dataset import AV_Dataset
 
 class AV_Dataloader:
     def __init__(self, dataset_name, mode, batch_size, num_workers,
