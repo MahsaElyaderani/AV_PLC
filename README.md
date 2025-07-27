@@ -11,7 +11,7 @@ AV_ReVoice is an Audio-Visual speech reconstruction framework that trains a neur
 ├── checkpoints/             # Trained model checkpoints
 ├── logs/                    # Training and evaluation logs
 ├── save_features.py         # Parallel video feature extraction
-├── model.py                 # AV\_ReVoice model definition
+├── model.py                 # AV_ReVoice model definition
 ├── trainer.py               # Training and evaluation logic
 ├── av_l_dataloader.py       # Custom dataloader for AV inputs
 ├── main.py                  # Main training/feature extraction script
