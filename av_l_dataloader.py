@@ -46,7 +46,8 @@ class AVDataloader:
                           batch_size=self.batch_size,
                           shuffle=True,
                           num_workers=self.num_workers,
-                          pin_memory=True,)
+                          pin_memory=True,
+                          collate_fn=self.av_collate_fn,)
                           #worker_init_fn=self.worker_init_fn)
 
     def val_dataloader(self):
@@ -61,7 +62,8 @@ class AVDataloader:
                           shuffle=False,
                           num_workers=self.num_workers,
                           pin_memory=True,
-                          drop_last=True,)
+                          drop_last=True,
+                          collate_fn=self.av_collate_fn,)
                           #worker_init_fn=self.worker_init_fn)
 
     def test_dataloader(self, mask_range):
@@ -82,7 +84,31 @@ class AVDataloader:
                           num_workers=self.num_workers,
                           pin_memory=True,
                           drop_last=True,
+                          collate_fn=self.av_collate_fn,
                           worker_init_fn=self.worker_init_fn)
+
+    def av_collate_fn(self, batch):
+        if self.mode == 'v':
+            frames, spk_embs, masked_specs, mel_specs, masks = zip(*batch)
+
+            processed_frames = []
+            for f in frames:  # each f: [T, C, H, W] or [75, 1, 112, 112]
+                f = f.permute(1, 0, 2, 3).unsqueeze(0)  # → [1, C, T, H, W]
+                _, C, T, H, W = f.shape
+                if T < 75:
+                    f = torch.nn.functional.interpolate(f, size=(75, H, W),
+                                                        mode='trilinear',
+                                                        align_corners=False)
+                f = f.squeeze(0).permute(1, 0, 2, 3)  # → [75, C, H, W]
+                processed_frames.append(f)
+
+            frames = torch.stack(processed_frames)  # [B, 75, C, H, W]
+            spk_embs = torch.stack([torch.as_tensor(s) for s in spk_embs])
+            masked_specs = torch.stack(masked_specs)
+            mel_specs = torch.stack(mel_specs)
+            masks = torch.stack(masks)
+
+            return frames, spk_embs, masked_specs, mel_specs, masks
 
     def __repr__(self) -> str:
         return (
