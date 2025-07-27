@@ -77,11 +77,12 @@ class AVDataset(Dataset):
         chunk_idx, video_key = self.index_map[idx]
         h5f = self._get_h5_file(chunk_idx)
 
-        mel_spec = torch.tensor(h5f[f"{video_key}/mel_spec"][:], dtype=torch.float32)
+        mel_spec = torch.tensor(h5f[f"{video_key}/spec"][:], dtype=torch.float32)
         text = h5f[f"{video_key}/text"][:]
         mask = h5f[f"{video_key}/mask"][:] if self.mask_range == 'rand' else h5f[f"{video_key}/mask_{self.mask_range}"][:]
         mask = torch.tensor(mask, dtype=torch.float32)
-        masked_spec = torch.nn.functional.layer_norm(mel_spec, mel_spec.shape) * mask
+        mel_spec = torch.nn.functional.layer_norm(mel_spec, mel_spec.shape)
+        masked_spec = mel_spec * mask
 
         if self.mode == 'a':
             return masked_spec, mel_spec, text, mask
@@ -96,7 +97,7 @@ class AVDataset(Dataset):
 
         elif self.mode == 'v':
             frames = h5f[f"{video_key}/frames"][:]
-            spk_emb = h5f[f"{video_key}/spkr_embd"][:]
+            spk_emb = h5f[f"{video_key}/spkr_embed"][:]
             frames = self._process_video_frames(frames)
             return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
 
@@ -123,7 +124,7 @@ if __name__ == "__main__":
     # base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
     # path = base_path + 'vox2_short_test_features_chunk*.h5'
 
-    base_path = 'datasets/grid/'
+    base_path = '/home/ai/Projects/Mahsa/datasets/grid/' #'datasets/grid/'
     path = base_path + 'grid_test_features_chunk*.h5'
 
     dataset = AVDataset(path, mode='v', mask_range='60')
@@ -132,7 +133,7 @@ if __name__ == "__main__":
     for frames, spk_emb, masked_spec, mel_spec, mask in dataloader:
         print(frames.shape)
         print(mel_spec[0].shape)
-        plt.imshow(mel_spec[0])
+        #plt.imshow(mel_spec[0])
         plt.imshow(frames[0, 30,0, ...])
         plt.show()
 
