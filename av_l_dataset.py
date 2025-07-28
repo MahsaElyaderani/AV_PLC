@@ -77,7 +77,7 @@ class AVDataset(Dataset):
         chunk_idx, video_key = self.index_map[idx]
         h5f = self._get_h5_file(chunk_idx)
 
-        mel_spec = torch.tensor(h5f[f"{video_key}/spec"][:], dtype=torch.float32)
+        mel_spec = torch.tensor(h5f[f"{video_key}/mel_spec"][:], dtype=torch.float32)
         text = h5f[f"{video_key}/text"][:]
         mask = h5f[f"{video_key}/mask"][:] if self.mask_range == 'rand' else h5f[f"{video_key}/mask_{self.mask_range}"][:]
         mask = torch.tensor(mask, dtype=torch.float32)
@@ -97,7 +97,7 @@ class AVDataset(Dataset):
 
         elif self.mode == 'v':
             frames = h5f[f"{video_key}/frames"][:]
-            spk_emb = h5f[f"{video_key}/spkr_embed"][:]
+            spk_emb = h5f[f"{video_key}/spkr_embd"][:]
             frames = self._process_video_frames(frames)
             return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
 
