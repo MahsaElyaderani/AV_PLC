@@ -4,9 +4,9 @@ import glob
 import argparse
 
 from save_features import extract_features_parallel
-from model import AV_ReVoice
-from trainer import Trainer, setup_logging
-from av_l_dataloader import AVDataloader
+from av_model import AV_ReVoice
+from trainer_withdrop import Trainer, setup_logging
+from av_l_dataloader_withdrop import AVDataloader
 
 def main(args):
     if args.save_features:
