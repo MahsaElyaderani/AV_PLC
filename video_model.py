@@ -5,9 +5,10 @@ import torch.nn as nn
 
 from conformer import Conformer
 
-from resnet import ResNetModel
-from av_l_dataloader import AVDataloader
-from trainer import Trainer, setup_logging
+from resnet_ import ResNetModel
+from av_dataloader_OOM import AVDataloader
+#from trainer_OOM import Trainer, setup_logging
+from trainer_cpu import Trainer, setup_logging
 
 
 class Video_PLC(nn.Module):
@@ -51,7 +52,6 @@ class Video_PLC(nn.Module):
     def forward(self, frame, spk_emb):
         b, t_v, c, h, w = frame.shape
         x = frame.permute(0, 2, 1, 3, 4)  # [b, c=1, t_v, h, w]
-
         x = self.frontend(x)  # [b, c, t_v, h', w']
         x = self.resnet(x)  # [b, t_v, 512]
 
@@ -68,14 +68,14 @@ class Video_PLC(nn.Module):
 
 if __name__ == "__main__":
 
-    batch_size = 16
+    batch_size = 8
     num_epochs = 200
     learning_rate = 0.0001
 
-    conformer_blocks = 4 #6
+    conformer_blocks = 6 #4
     pesq_flag = False
     l2s_flags = [True]
-    dataset_names = ['grid'] #['voxceleb2']
+    dataset_names = ['grid'] #['grid']
     plc_loss_rates = ['20', '30', '40', '50', '60', 'rand']
 
 
@@ -88,7 +88,7 @@ if __name__ == "__main__":
 
     for dataset_name in dataset_names:
         for l2s_flag in l2s_flags:
-                model_name = f"video_plc_reg_aug_4blcks{'_sc' if l2s_flag else ''}{'_pesq' if pesq_flag else ''}({dataset_name})"
+                model_name = f"video_plc_reg_aug{'_sc' if l2s_flag else ''}{'_pesq' if pesq_flag else ''}({dataset_name})"
                 logger = setup_logging(model_name, log_dir)
                 logger.info(f"Using device: {device}")
 
@@ -99,7 +99,8 @@ if __name__ == "__main__":
 
                 logger.info("Initializing dataloaders...")
                 av_dataloader = AVDataloader(mode='v', dataset_name=dataset_name,
-                                             batch_size=batch_size, num_workers=8)
+                                            batch_size=batch_size, num_workers=4)
+
                 train_loader = av_dataloader.train_dataloader()
                 val_loader = av_dataloader.val_dataloader()
 

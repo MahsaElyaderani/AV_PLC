@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from scipy.io.wavfile import write
 from collections import defaultdict
 
+import gc
 import torch
 import torchaudio
 import torch.nn as nn
@@ -20,10 +21,13 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
+from asteroid.losses.pmsqe import SingleSrcPMSQE
 
+from audio_processing import torch_mel2spec
 from metrics import Vocoder, torch_mel_to_audio
 from metrics import calculate_batch_metrics, calculate_metrics
-from losses import SingleSrcPMSQE, MaskedLoss, MSELoss, SVTS_Loss
+from losses import MSELoss, L1Loss, SpectralConvergenceLoss#, SVTS_Loss
+
 
 
 def setup_logging(model_name, log_dir='logs'):
@@ -61,9 +65,13 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.learning_rate = learning_rate
-        self.device = device
         self.checkpoint_dir = checkpoint_dir
         self.log_dir = log_dir
+        self.device = (
+            torch.device('cuda') if torch.cuda.is_available()
+            else torch.device('mps') if torch.backends.mps.is_built() and torch.backends.mps.is_available()
+            else torch.device('cpu')
+        )
 
         self.tokenizer = None
         self.vocoder = None
@@ -95,22 +103,24 @@ class Trainer:
         self._save_config()
 
         if self.mode == 'motion' or self.mode == 'a':
-            self.criterion = MSELoss()
+            self.rec_criterion = L1Loss().to(device) #MSELoss()
         elif self.mode == 'av':
-            self.criterion = MaskedLoss()
+            self.rec_criterion = L1Loss().to(device) #MSELoss() #MaskedLoss()
         elif self.mode == 'v':
-            self.rec_criterion = MSELoss()
+            self.rec_criterion = L1Loss().to(device) #MSELoss()
 
         if self.pesq_loss:
             self.pesq_criterion = SingleSrcPMSQE().to(device)
-            self.w_pmsqe = 0.001
+            self.w_pmsqe = 0.01 #0.01
 
         if self.l2s_loss:
-            self.w = 0.001
-            self.synth_criterion = SVTS_Loss()
+            self.w = 1 #0.001
+            #self.synth_criterion = L1Loss()
+            self.sc_criterion = SpectralConvergenceLoss().to(device)
 
 
-        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate,)
+        self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate,
+                                     weight_decay=0.01, betas=(0.9, 0.98))
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=150)  # 150 epochs
 
         self.model.to(device)
@@ -313,54 +323,77 @@ class Trainer:
 
         for batch_idx, batch in enumerate(train_iterator):
 
-            if self.mode == 'a':
-                mvisual_feats, spk_emb, masked_spec, spec, mask = batch
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
 
+            visual_feats, spk_emb, masked_spec, spec, mask = batch
+
+            if self.mode == 'a':
                 masked_spec = masked_spec.float().to(self.device)
                 spec = spec.float().to(self.device)
 
                 rec_spec = self.model(masked_spec)
-                rec_loss = self.rec_criterion(rec_spec, spec, mask=False)
+                rec_loss = self.rec_criterion(rec_spec, spec)
                 synth_loss = 0.0
 
                 if self.pesq_loss:
                     pmsqe_loss = torch.mean(
-                        self.pesq_criterion(torch.exp(rec_spec).permute(0, 2, 1),
-                                            torch.exp(spec).permute(0, 2, 1)))
+                        self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                            torch_mel2spec(spec).permute(0, 2, 1)))
                 else:
                     pmsqe_loss = 0
 
                 loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss)
 
-            else:
-                visual_feats, spk_emb, masked_spec, spec, mask = batch
+            elif self.mode == 'v':
+
+                visual_feats = visual_feats.float().to(self.device)
+                spk_emb = spk_emb.float().to(self.device)
+                spec = spec.float().to(self.device)
+
+                synth_spec = self.model(visual_feats, spk_emb)
+                synth_loss = self.rec_criterion(synth_spec, spec)
+
+                if self.l2s_loss:
+                    sc_loss = self.sc_criterion(synth_spec, spec)
+                else:
+                    sc_loss = 0.0
+
+                if self.pesq_loss:
+                    pmsqe_loss = torch.mean(
+                        self.pesq_criterion(torch_mel2spec(synth_spec).permute(0, 2, 1),
+                                            torch_mel2spec(spec).permute(0, 2, 1)))
+                else:
+                    pmsqe_loss = 0
+
+                loss = (sc_loss + synth_loss + self.w_pmsqe * pmsqe_loss)
+
+            elif self.mode == 'av':
 
                 visual_feats = visual_feats.float().to(self.device)
                 spk_emb = spk_emb.float().to(self.device)
                 masked_spec = masked_spec.float().to(self.device)
                 spec = spec.float().to(self.device)
 
-                if self.l2s_loss:
-                    rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
-                    rec_loss = self.rec_criterion(rec_spec, spec)
-                    synth_loss = self.synth_criterion(synth_spec, spec)
+                rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
+                rec_loss = self.rec_criterion(rec_spec, spec)
+                synth_loss = self.rec_criterion(synth_spec, spec)
 
+                if self.l2s_loss:
+                    sc_loss = self.sc_criterion(synth_spec, spec)
                 else:
-                    rec_spec = self.model(masked_spec, visual_feats, spk_emb)
-                    rec_loss = self.rec_criterion(rec_spec)
-                    synth_loss = 0
+                    sc_loss = 0.0
 
                 if self.pesq_loss:
                     pmsqe_loss = torch.mean(
-                        self.pesq_criterion(torch.exp(rec_spec).permute(0, 2, 1),
-                                            torch.exp(spec).permute(0, 2, 1)))
+                        self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                            torch_mel2spec(spec).permute(0, 2, 1)))
                 else:
                     pmsqe_loss = 0
 
-                loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss)
+                loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * (synth_loss + sc_loss))
 
             self.optimizer.zero_grad()
-
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
@@ -369,8 +402,9 @@ class Trainer:
             current_lr = self.optimizer.param_groups[0]['lr']
 
             train_iterator.set_postfix({"loss": f"{loss.item():.4f}",
-                                        "rec loss": f"{rec_loss.item():.5f}",
-                                        "l2s loss": f"{synth_loss.item():.4f}" if self.l2s_loss else None,
+                                        "rec loss": f"{rec_loss.item():.5f}" if self.mode == 'a' or self.mode == 'av' else None,
+                                        "l2s loss": f"{synth_loss.item():.4f}" if self.mode == 'v' or self.mode == 'av' else None,
+                                        "sc loss": f"{sc_loss.item():.4f}" if self.l2s_loss else None,
                                         "pesq loss": f"{pmsqe_loss.item():.4f}" if self.pesq_loss else None,
                                          "lr": f"{current_lr:.9f}"})
 
@@ -397,72 +431,108 @@ class Trainer:
 
         with (torch.no_grad()):
             for batch_idx, batch in enumerate(val_iterator):
-                if self.mode == 'a':
-                    mvisual_feats, spk_emb, masked_spec, spec, mask = batch
 
-                    masked_spec = masked_spec.float().to(self.device)
-                    spec = spec.float().to(self.device)
+                try:
 
-                    rec_spec = self.model(masked_spec)
-                    rec_loss = self.rec_criterion(rec_spec, spec, mask=False)
-                    synth_loss = 0.0
+                    if batch_idx % 5 == 0:
+                        torch.cuda.empty_cache()
 
-                    if self.pesq_loss:
-                        pmsqe_loss = torch.mean(
-                            self.pesq_criterion(torch.exp(rec_spec).permute(0, 2, 1),
-                                                torch.exp(spec).permute(0, 2, 1)))
-                    else:
-                        pmsqe_loss = 0
-
-                    loss = rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss
-
-                else:
                     visual_feats, spk_emb, masked_spec, spec, mask = batch
 
-                    visual_feats = visual_feats.float().to(self.device)
-                    spk_emb = spk_emb.float().to(self.device)
-                    masked_spec = masked_spec.float().to(self.device)
-                    spec = spec.float().to(self.device)
+                    if self.mode == 'a':
+                        masked_spec = masked_spec.float().to(self.device)
+                        spec = spec.float().to(self.device)
 
-                    if self.l2s_loss:
+                        rec_spec = self.model(masked_spec)
+                        rec_loss = self.rec_criterion(rec_spec, spec)
+                        synth_loss = 0.0
+
+                        if self.pesq_loss:
+                            pmsqe_loss = torch.mean(
+                                self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                                    torch_mel2spec(spec).permute(0, 2, 1)))
+                        else:
+                            pmsqe_loss = 0
+
+                        loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss)
+
+                    elif self.mode == 'v':
+
+                        visual_feats = visual_feats.float().to(self.device)
+                        spk_emb = spk_emb.float().to(self.device)
+                        spec = spec.float().to(self.device)
+
+                        rec_spec = self.model(visual_feats, spk_emb)
+                        synth_loss = self.rec_criterion(rec_spec, spec)
+
+                        if self.l2s_loss:
+                            sc_loss = self.sc_criterion(rec_spec, spec)
+                        else:
+                            sc_loss = 0.0
+
+                        if self.pesq_loss:
+                            pmsqe_loss = torch.mean(
+                                self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                                    torch_mel2spec(spec).permute(0, 2, 1)))
+                        else:
+                            pmsqe_loss = 0
+
+                        loss = (sc_loss + synth_loss + self.w_pmsqe * pmsqe_loss)
+
+                    elif self.mode == 'av':
+
+                        visual_feats = visual_feats.float().to(self.device)
+                        spk_emb = spk_emb.float().to(self.device)
+                        masked_spec = masked_spec.float().to(self.device)
+                        spec = spec.float().to(self.device)
+
                         rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
                         rec_loss = self.rec_criterion(rec_spec, spec)
-                        synth_loss = self.synth_criterion(synth_spec, spec)
+                        synth_loss = self.rec_criterion(synth_spec, spec)
 
-                    else:
-                        rec_spec = self.model(masked_spec, visual_feats, spk_emb)
-                        rec_loss = self.rec_criterion(rec_spec)
-                        synth_loss = 0
+                        if self.l2s_loss:
+                            sc_loss = self.sc_criterion(synth_spec, spec)
+                        else:
+                            sc_loss = 0.0
 
-                    if self.pesq_loss:
-                        pmsqe_loss = torch.mean(
-                            self.pesq_criterion(torch.exp(rec_spec).permute(0, 2, 1),
-                                                torch.exp(spec).permute(0, 2, 1)))
-                    else:
-                        pmsqe_loss = 0
+                        if self.pesq_loss:
+                            pmsqe_loss = torch.mean(
+                                self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                                    torch_mel2spec(spec).permute(0, 2, 1)))
+                        else:
+                            pmsqe_loss = 0
 
-                    loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss)
+                        loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * (synth_loss + sc_loss))
 
-                val_loss += loss.item()
-                val_iterator.set_postfix({"loss": f"{loss.item():.4f}"})
+                    val_loss += loss.item()
+                    val_iterator.set_postfix({"loss": f"{loss.item():.4f}"})
 
-                if batch_idx == 0:
-                    metrics = calculate_batch_metrics(
-                        spec,
-                        rec_spec,
-                        None,
-                        None,#text.cpu().numpy() if self.asr_loss else None,
-                        None,#pred_text.cpu().numpy() if self.asr_loss else None,
-                        None, #self.vocoder,
-                        None,#self.tokenizer if self.asr_loss else None,
-                        max_samples=len(spec)
-                    )
-                    #del spec, masked_spec, rec_spec
+                    if batch_idx == 0:
+                        metrics = calculate_batch_metrics(
+                            spec,
+                            rec_spec,
+                            None,
+                            None,#text.cpu().numpy() if self.asr_loss else None,
+                            None,#pred_text.cpu().numpy() if self.asr_loss else None,
+                            None, #self.vocoder,
+                            None,#self.tokenizer if self.asr_loss else None,
+                            max_samples=len(spec)
+                        )
+                        # Clean up GPU memory
+                        del spec, masked_spec, rec_spec
+                        if self.mode in ['v', 'av']:
+                            del visual_feats, spk_emb
+                        torch.cuda.empty_cache()
+
+                        for k, v in metrics.items():
+                            total_metrics[k] += v
+                        count += 1
+
+                except torch.cuda.OutOfMemoryError:
+                    print(f"CUDA OOM during validation at batch {batch_idx}, skipping")
                     torch.cuda.empty_cache()
-
-                    for k, v in metrics.items():
-                        total_metrics[k] += v
-                    count += 1
+                    gc.collect()
+                    continue
 
         for k in total_metrics:
             total_metrics[k] /= count
@@ -480,6 +550,7 @@ class Trainer:
 
         self.model.eval()
         batch = next(iter(self.val_loader))
+
         if self.mode == 'a':
             visual_feats, spk_emb, masked_spec, spec, mask = batch
             spec = spec.float().to(self.device)
@@ -490,8 +561,165 @@ class Trainer:
 
             with torch.no_grad():
                 rec_spec = self.model(masked_spec)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fig, axes = plt.subplots(num_samples * 2, 3, figsize=(20, 5 * num_samples))
 
-        else:
+            for i in range(num_samples):
+                if self.vocoder is None:
+                    original_audio = torch_mel_to_audio(spec[i].cpu(), None)
+                    masked_audio = torch_mel_to_audio(masked_spec[i].cpu(), None)
+                    reconstructed_audio = torch_mel_to_audio(rec_spec[i].cpu(), None)
+                else:
+                    original_audio = self.vocoder.convert(spec[i])
+                    masked_audio = self.vocoder.convert(masked_spec[i])
+                    reconstructed_audio = self.vocoder.convert(rec_spec[i])
+
+                original_audio = original_audio.cpu().numpy()
+                masked_audio = masked_audio.cpu().numpy()
+                reconstructed_audio = reconstructed_audio.cpu().numpy()
+
+                spec_np = spec[i].cpu().numpy()
+                masked_spec_np = masked_spec[i].cpu().numpy()
+                rec_spec_np = rec_spec[i].cpu().numpy()
+
+                row = i * 2
+
+                im1 = axes[row, 0].imshow(masked_spec_np, aspect='auto', origin='lower', interpolation='none')
+                axes[row, 0].set_title(f'Input Spec - Sample {i + 1}')
+                fig.colorbar(im1, ax=axes[row, 0], format='%+2.0f')
+
+                im2 = axes[row, 1].imshow(rec_spec_np, aspect='auto', origin='lower', interpolation='none')
+                axes[row, 1].set_title(f'Reconstructed Spec - Sample {i + 1}')
+                fig.colorbar(im2, ax=axes[row, 1], format='%+2.0f')
+
+                im4 = axes[row, 2].imshow(spec_np, aspect='auto', origin='lower', interpolation='none')
+                axes[row, 2].set_title(f'Original Spec - Sample {i + 1}')
+                fig.colorbar(im4, ax=axes[row, 2], format='%+2.0f')
+
+                mse = np.mean((spec_np - rec_spec_np) ** 2)
+                axes[row, 0].set_ylabel(f'MSE: {mse:.4f}')
+
+                # orig_path = os.path.join(audio_dir, f'original_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                # masked_path = os.path.join(audio_dir, f'masked_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                # recon_path = os.path.join(audio_dir,
+                #                           f'reconstructed_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                #
+                # write(orig_path, self.sample_rate, original_audio)
+                # write(masked_path, self.sample_rate, masked_audio)
+                # write(recon_path, self.sample_rate, reconstructed_audio)
+
+                time_orig = np.arange(len(original_audio)) / self.sample_rate
+                time_masked = np.arange(len(masked_audio)) / self.sample_rate
+                time_recon = np.arange(len(reconstructed_audio)) / self.sample_rate
+
+                axes[row + 1, 0].plot(time_masked, masked_audio)
+                axes[row + 1, 0].set_title(f'Input Waveform - Sample {i + 1}')
+                axes[row + 1, 0].set_xlabel('Time (s)')
+                axes[row + 1, 0].set_ylabel('Amplitude')
+
+                axes[row + 1, 1].plot(time_recon, reconstructed_audio)
+                axes[row + 1, 1].set_title(f'Reconstructed Waveform - Sample {i + 1}')
+                axes[row + 1, 1].set_xlabel('Time (s)')
+
+                axes[row + 1, 2].plot(time_orig, original_audio)
+                axes[row + 1, 2].set_title(f'Original Waveform - Sample {i + 1}')
+                axes[row + 1, 2].set_xlabel('Time (s)')
+
+            plt.suptitle(f'Spectrogram and Waveform Comparison - Epoch {epoch}')
+            plt.tight_layout()
+
+            fig_path = os.path.join(plot_dir, f'Spec_waveform_comparison_epoch{epoch}_{timestamp}.png')
+            plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+
+        elif self.mode == 'v':
+
+            visual_feats, spk_emb, masked_spec, spec, mask = batch
+            visual_feats = visual_feats.float().to(self.device)
+            spk_emb = spk_emb.float().to(self.device)
+            spec = spec.float().to(self.device)
+            masked_spec = masked_spec.float().to(self.device)
+
+            visual_feats = visual_feats[:num_samples]
+            spk_emb = spk_emb[:num_samples]
+            spec = spec[:num_samples]
+
+            with torch.no_grad():
+                rec_spec = self.model(visual_feats, spk_emb)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fig, axes = plt.subplots(num_samples * 2, 3, figsize=(20, 5 * num_samples))
+
+            for i in range(num_samples):
+                if self.vocoder is None:
+                    original_audio = torch_mel_to_audio(spec[i].cpu(), None)
+                    masked_audio = torch_mel_to_audio(masked_spec[i].cpu(), None)
+                    reconstructed_audio = torch_mel_to_audio(rec_spec[i].cpu(), None)
+                else:
+                    original_audio = self.vocoder.convert(spec[i])
+                    masked_audio = self.vocoder.convert(masked_spec[i])
+                    reconstructed_audio = self.vocoder.convert(rec_spec[i])
+
+                original_audio = original_audio.cpu().numpy()
+                masked_audio = masked_audio.cpu().numpy()
+                reconstructed_audio = reconstructed_audio.cpu().numpy()
+
+                spec_np = spec[i].cpu().numpy()
+                masked_spec_np = masked_spec[i].cpu().numpy()
+                rec_spec_np = rec_spec[i].cpu().numpy()
+
+                row = i * 2
+
+                im1 = axes[row, 0].imshow(masked_spec_np, aspect='auto', origin='lower', interpolation='none')
+                axes[row, 0].set_title(f'Input Spec - Sample {i + 1}')
+                fig.colorbar(im1, ax=axes[row, 0], format='%+2.0f')
+
+                im2 = axes[row, 1].imshow(rec_spec_np, aspect='auto', origin='lower', interpolation='none')
+                axes[row, 1].set_title(f'Reconstructed Spec - Sample {i + 1}')
+                fig.colorbar(im2, ax=axes[row, 1], format='%+2.0f')
+
+                im4 = axes[row, 2].imshow(spec_np, aspect='auto', origin='lower', interpolation='none')
+                axes[row, 2].set_title(f'Original Spec - Sample {i + 1}')
+                fig.colorbar(im4, ax=axes[row, 2], format='%+2.0f')
+
+                mse = np.mean((spec_np - rec_spec_np) ** 2)
+                axes[row, 0].set_ylabel(f'MSE: {mse:.4f}')
+
+                # orig_path = os.path.join(audio_dir, f'original_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                # masked_path = os.path.join(audio_dir, f'masked_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                # recon_path = os.path.join(audio_dir,
+                #                           f'reconstructed_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                #
+                # write(orig_path, self.sample_rate, original_audio)
+                # write(masked_path, self.sample_rate, masked_audio)
+                # write(recon_path, self.sample_rate, reconstructed_audio)
+
+                time_orig = np.arange(len(original_audio)) / self.sample_rate
+                time_masked = np.arange(len(masked_audio)) / self.sample_rate
+                time_recon = np.arange(len(reconstructed_audio)) / self.sample_rate
+
+                axes[row + 1, 0].plot(time_masked, masked_audio)
+                axes[row + 1, 0].set_title(f'Input Waveform - Sample {i + 1}')
+                axes[row + 1, 0].set_xlabel('Time (s)')
+                axes[row + 1, 0].set_ylabel('Amplitude')
+
+                axes[row + 1, 1].plot(time_recon, reconstructed_audio)
+                axes[row + 1, 1].set_title(f'Reconstructed Waveform - Sample {i + 1}')
+                axes[row + 1, 1].set_xlabel('Time (s)')
+
+                axes[row + 1, 2].plot(time_orig, original_audio)
+                axes[row + 1, 2].set_title(f'Original Waveform - Sample {i + 1}')
+                axes[row + 1, 2].set_xlabel('Time (s)')
+
+            plt.suptitle(f'Spectrogram and Waveform Comparison - Epoch {epoch}')
+            plt.tight_layout()
+
+            fig_path = os.path.join(plot_dir, f'Spec_waveform_comparison_epoch{epoch}_{timestamp}.png')
+            plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+        elif self.mode == 'av':
 
             visual_feats, spk_emb, masked_spec, spec, mask = batch
             visual_feats = visual_feats.float().to(self.device)
@@ -505,170 +733,97 @@ class Trainer:
             spk_emb = spk_emb[:num_samples]
 
             with torch.no_grad():
-                if self.l2s_loss:
-                    rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
+                rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
 
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    fig, axes = plt.subplots(num_samples * 2, 4, figsize=(20, 5 * num_samples))
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                fig, axes = plt.subplots(num_samples * 2, 4, figsize=(20, 5 * num_samples))
 
-                    for i in range(num_samples):
-                        if self.vocoder is None:
-                            original_audio = torch_mel_to_audio(spec[i].cpu(), None)
-                            masked_audio = torch_mel_to_audio(masked_spec[i].cpu(), None)
-                            reconstructed_audio = torch_mel_to_audio(rec_spec[i].cpu(), None)
-                            Synthesized_audio = torch_mel_to_audio(synth_spec[i].cpu(), None)
-                        else:
-                            original_audio = self.vocoder.convert(spec[i])
-                            masked_audio = self.vocoder.convert(masked_spec[i])
-                            reconstructed_audio = self.vocoder.convert(rec_spec[i])
-                            Synthesized_audio = self.vocoder.convert(synth_spec[i])
+                for i in range(num_samples):
+                    if self.vocoder is None:
+                        original_audio = torch_mel_to_audio(spec[i].cpu(), None)
+                        masked_audio = torch_mel_to_audio(masked_spec[i].cpu(), None)
+                        reconstructed_audio = torch_mel_to_audio(rec_spec[i].cpu(), None)
+                        Synthesized_audio = torch_mel_to_audio(synth_spec[i].cpu(), None)
+                    else:
+                        original_audio = self.vocoder.convert(spec[i])
+                        masked_audio = self.vocoder.convert(masked_spec[i])
+                        reconstructed_audio = self.vocoder.convert(rec_spec[i])
+                        Synthesized_audio = self.vocoder.convert(synth_spec[i])
 
-                        original_audio = original_audio.cpu().numpy()
-                        masked_audio = masked_audio.cpu().numpy()
-                        reconstructed_audio = reconstructed_audio.cpu().numpy()
-                        Synthesized_audio = Synthesized_audio.cpu().numpy()
+                    original_audio = original_audio.cpu().numpy()
+                    masked_audio = masked_audio.cpu().numpy()
+                    reconstructed_audio = reconstructed_audio.cpu().numpy()
+                    Synthesized_audio = Synthesized_audio.cpu().numpy()
 
 
-                        spec_np = spec[i].cpu().numpy()
-                        masked_spec_np = masked_spec[i].cpu().numpy()
-                        rec_spec_np = rec_spec[i].cpu().numpy()
-                        synth_spec_np = synth_spec[i].cpu().numpy()
+                    spec_np = spec[i].cpu().numpy()
+                    masked_spec_np = masked_spec[i].cpu().numpy()
+                    rec_spec_np = rec_spec[i].cpu().numpy()
+                    synth_spec_np = synth_spec[i].cpu().numpy()
 
-                        row = i * 2
+                    row = i * 2
 
-                        im1 = axes[row, 0].imshow(masked_spec_np, aspect='auto', origin='lower', interpolation='none')
-                        axes[row, 0].set_title(f'Input Spec - Sample {i + 1}')
-                        fig.colorbar(im1, ax=axes[row, 0], format='%+2.0f')
+                    im1 = axes[row, 0].imshow(masked_spec_np, aspect='auto', origin='lower', interpolation='none')
+                    axes[row, 0].set_title(f'Input Spec - Sample {i + 1}')
+                    fig.colorbar(im1, ax=axes[row, 0], format='%+2.0f')
 
-                        im2 = axes[row, 1].imshow(rec_spec_np, aspect='auto', origin='lower', interpolation='none')
-                        axes[row, 1].set_title(f'Reconstructed Spec - Sample {i + 1}')
-                        fig.colorbar(im2, ax=axes[row, 1], format='%+2.0f')
+                    im2 = axes[row, 1].imshow(rec_spec_np, aspect='auto', origin='lower', interpolation='none')
+                    axes[row, 1].set_title(f'Reconstructed Spec - Sample {i + 1}')
+                    fig.colorbar(im2, ax=axes[row, 1], format='%+2.0f')
 
-                        im3 = axes[row, 2].imshow(synth_spec_np, aspect='auto', origin='lower', interpolation='none')
-                        axes[row, 2].set_title(f'Synthesized Spec - Sample {i + 1}')
-                        fig.colorbar(im3, ax=axes[row, 2], format='%+2.0f')
+                    im3 = axes[row, 2].imshow(synth_spec_np, aspect='auto', origin='lower', interpolation='none')
+                    axes[row, 2].set_title(f'Synthesized Spec - Sample {i + 1}')
+                    fig.colorbar(im3, ax=axes[row, 2], format='%+2.0f')
 
-                        im4 = axes[row, 3].imshow(spec_np, aspect='auto', origin='lower', interpolation='none')
-                        axes[row, 3].set_title(f'Original Spec - Sample {i + 1}')
-                        fig.colorbar(im4, ax=axes[row, 3], format='%+2.0f')
+                    im4 = axes[row, 3].imshow(spec_np, aspect='auto', origin='lower', interpolation='none')
+                    axes[row, 3].set_title(f'Original Spec - Sample {i + 1}')
+                    fig.colorbar(im4, ax=axes[row, 3], format='%+2.0f')
 
-                        mse = np.mean((spec_np - rec_spec_np) ** 2)
-                        axes[row, 0].set_ylabel(f'MSE: {mse:.4f}')
+                    mse = np.mean((spec_np - rec_spec_np) ** 2)
+                    axes[row, 0].set_ylabel(f'MSE: {mse:.4f}')
 
-                        # orig_path = os.path.join(audio_dir, f'original_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
-                        # masked_path = os.path.join(audio_dir, f'masked_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
-                        # recon_path = os.path.join(audio_dir,
-                        #                           f'reconstructed_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
-                        #
-                        # write(orig_path, self.sample_rate, original_audio)
-                        # write(masked_path, self.sample_rate, masked_audio)
-                        # write(recon_path, self.sample_rate, reconstructed_audio)
+                    # orig_path = os.path.join(audio_dir, f'original_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                    # masked_path = os.path.join(audio_dir, f'masked_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                    # recon_path = os.path.join(audio_dir,
+                    #                           f'reconstructed_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
+                    #
+                    # write(orig_path, self.sample_rate, original_audio)
+                    # write(masked_path, self.sample_rate, masked_audio)
+                    # write(recon_path, self.sample_rate, reconstructed_audio)
 
-                        time_orig = np.arange(len(original_audio)) / self.sample_rate
-                        time_masked = np.arange(len(masked_audio)) / self.sample_rate
-                        time_recon = np.arange(len(reconstructed_audio)) / self.sample_rate
-                        time_synth = np.arange(len(Synthesized_audio)) / self.sample_rate
+                    time_orig = np.arange(len(original_audio)) / self.sample_rate
+                    time_masked = np.arange(len(masked_audio)) / self.sample_rate
+                    time_recon = np.arange(len(reconstructed_audio)) / self.sample_rate
+                    time_synth = np.arange(len(Synthesized_audio)) / self.sample_rate
 
-                        axes[row + 1, 0].plot(time_masked, masked_audio)
-                        axes[row + 1, 0].set_title(f'Input Waveform - Sample {i + 1}')
-                        axes[row + 1, 0].set_xlabel('Time (s)')
-                        axes[row + 1, 0].set_ylabel('Amplitude')
+                    axes[row + 1, 0].plot(time_masked, masked_audio)
+                    axes[row + 1, 0].set_title(f'Input Waveform - Sample {i + 1}')
+                    axes[row + 1, 0].set_xlabel('Time (s)')
+                    axes[row + 1, 0].set_ylabel('Amplitude')
 
-                        axes[row + 1, 1].plot(time_recon, reconstructed_audio)
-                        axes[row + 1, 1].set_title(f'Reconstructed Waveform - Sample {i + 1}')
-                        axes[row + 1, 1].set_xlabel('Time (s)')
+                    axes[row + 1, 1].plot(time_recon, reconstructed_audio)
+                    axes[row + 1, 1].set_title(f'Reconstructed Waveform - Sample {i + 1}')
+                    axes[row + 1, 1].set_xlabel('Time (s)')
 
-                        axes[row + 1, 2].plot(time_synth, Synthesized_audio)
-                        axes[row + 1, 2].set_title(f'Synthesized Waveform - Sample {i + 1}')
-                        axes[row + 1, 2].set_xlabel('Time (s)')
+                    axes[row + 1, 2].plot(time_synth, Synthesized_audio)
+                    axes[row + 1, 2].set_title(f'Synthesized Waveform - Sample {i + 1}')
+                    axes[row + 1, 2].set_xlabel('Time (s)')
 
-                        axes[row + 1, 3].plot(time_orig, original_audio)
-                        axes[row + 1, 3].set_title(f'Original Waveform - Sample {i + 1}')
-                        axes[row + 1, 3].set_xlabel('Time (s)')
+                    axes[row + 1, 3].plot(time_orig, original_audio)
+                    axes[row + 1, 3].set_title(f'Original Waveform - Sample {i + 1}')
+                    axes[row + 1, 3].set_xlabel('Time (s)')
 
-                    plt.suptitle(f'Spectrogram and Waveform Comparison - Epoch {epoch}')
-                    plt.tight_layout()
+                plt.suptitle(f'Spectrogram and Waveform Comparison - Epoch {epoch}')
+                plt.tight_layout()
 
-                    fig_path = os.path.join(plot_dir, f'Spec_waveform_comparison_epoch{epoch}_{timestamp}.png')
-                    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
-                    plt.close()
+                fig_path = os.path.join(plot_dir, f'Spec_waveform_comparison_epoch{epoch}_{timestamp}.png')
+                plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+                plt.close()
 
-                    self.writer.add_figure(f'Spectrogram_Waveform/epoch_{epoch}', fig, epoch)
-                    avg_mse = np.mean([np.mean((spec[j].cpu().numpy() - rec_spec[j].cpu().numpy()) ** 2)
-                                       for j in range(num_samples)])
-                    self.writer.add_scalar('Validation/MSE', avg_mse, epoch)
-                else:
-                    rec_spec = self.model(masked_spec, visual_feats)
-
-                    spec = spec.cpu().numpy()
-                    masked_spec = masked_spec.cpu().numpy()
-                    rec_spec = rec_spec.cpu().numpy()
-
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    fig, axes = plt.subplots(num_samples * 2, 3, figsize=(20, 5 * num_samples))
-
-                    for i in range(num_samples):
-                        row = i * 2
-
-                        im1 = axes[row, 0].imshow(masked_spec[i], aspect='auto', origin='lower', interpolation='none')
-                        axes[row, 0].set_title(f'Input Spec - Sample {i + 1}')
-                        fig.colorbar(im1, ax=axes[row, 0], format='%+2.0f')
-
-                        im2 = axes[row, 1].imshow(rec_spec[i], aspect='auto', origin='lower', interpolation='none')
-                        axes[row, 1].set_title(f'Reconstructed Spec - Sample {i + 1}')
-                        fig.colorbar(im2, ax=axes[row, 1], format='%+2.0f')
-
-                        im3 = axes[row, 2].imshow(spec[i], aspect='auto', origin='lower', interpolation='none')
-                        axes[row, 2].set_title(f'Original Spec - Sample {i + 1}')
-                        fig.colorbar(im3, ax=axes[row, 2], format='%+2.0f')
-
-                        mse = np.mean((spec[i] - rec_spec[i]) ** 2)
-                        axes[row, 0].set_ylabel(f'MSE: {mse:.4f}')
-
-                        if self.vocoder is None:
-                            original_audio = torch_mel_to_audio(spec[i], None)
-                            masked_audio = torch_mel_to_audio(masked_spec[i], None)
-                            reconstructed_audio = torch_mel_to_audio(rec_spec[i], None)
-                        else:
-                            original_audio = self.vocoder.convert(spec[i])
-                            masked_audio = self.vocoder.convert(masked_spec[i])
-                            reconstructed_audio = self.vocoder.convert(rec_spec[i])
-
-                        orig_path = os.path.join(audio_dir, f'original_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
-                        masked_path = os.path.join(audio_dir, f'masked_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
-                        recon_path = os.path.join(audio_dir, f'reconstructed_sample{i + 1}_epoch{epoch}_{timestamp}.wav')
-
-                        write(orig_path, self.sample_rate, original_audio)
-                        write(masked_path, self.sample_rate, masked_audio)
-                        write(recon_path, self.sample_rate, reconstructed_audio)
-
-                        time_orig = np.arange(len(original_audio)) / self.sample_rate
-                        time_masked = np.arange(len(masked_audio)) / self.sample_rate
-                        time_recon = np.arange(len(reconstructed_audio)) / self.sample_rate
-
-                        axes[row + 1, 0].plot(time_masked, masked_audio)
-                        axes[row + 1, 0].set_title(f'Input Waveform - Sample {i + 1}')
-                        axes[row + 1, 0].set_xlabel('Time (s)')
-                        axes[row + 1, 0].set_ylabel('Amplitude')
-
-                        axes[row + 1, 1].plot(time_recon, reconstructed_audio)
-                        axes[row + 1, 1].set_title(f'Reconstructed Waveform - Sample {i + 1}')
-                        axes[row + 1, 1].set_xlabel('Time (s)')
-
-                        axes[row + 1, 2].plot(time_orig, original_audio)
-                        axes[row + 1, 2].set_title(f'Original Waveform - Sample {i + 1}')
-                        axes[row + 1, 2].set_xlabel('Time (s)')
-
-                    plt.suptitle(f'Spectrogram and Waveform Comparison - Epoch {epoch}')
-                    plt.tight_layout()
-
-                    fig_path = os.path.join(plot_dir, f'Spec_waveform_comparison_epoch{epoch}_{timestamp}.png')
-                    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
-                    plt.close()
-
-                    self.writer.add_figure(f'Spectrogram_Waveform/epoch_{epoch}', fig, epoch)
-                    avg_mse = np.mean([np.mean((spec[j] - rec_spec[j]) ** 2) for j in range(num_samples)])
-                    self.writer.add_scalar('Validation/MSE', avg_mse, epoch)
+                self.writer.add_figure(f'Spectrogram_Waveform/epoch_{epoch}', fig, epoch)
+                avg_mse = np.mean([np.mean((spec[j].cpu().numpy() - rec_spec[j].cpu().numpy()) ** 2)
+                                   for j in range(num_samples)])
+                self.writer.add_scalar('Validation/MSE', avg_mse, epoch)
 
     def evaluate(self, test_loader, loss_rate):
 
@@ -709,52 +864,76 @@ class Trainer:
 
             with torch.no_grad():
                 for batch_idx, batch in enumerate(test_iterator):
+
+                    visual_feats, spk_emb, masked_spec, spec, mask = batch
+
                     if self.mode == 'a':
-                        masked_spec, spec, mask = batch
-                        spec = spec.float().to(self.device)
                         masked_spec = masked_spec.float().to(self.device)
-                        mask = mask.float().to(self.device)
+                        spec = spec.float().to(self.device)
 
                         rec_spec = self.model(masked_spec)
-                        rec_loss = self.rec_criterion(rec_spec, spec, False)
+                        rec_loss = self.rec_criterion(rec_spec, spec)
                         synth_loss = 0.0
 
                         if self.pesq_loss:
-                            pmsqe_loss = torch.mean(self.pesq_criterion(torch.exp(rec_spec).permute(0, 2, 1),
-                                                                        torch.exp(spec).permute(0, 2, 1)))
+                            pmsqe_loss = torch.mean(
+                                self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                                    torch_mel2spec(spec).permute(0, 2, 1)))
                         else:
                             pmsqe_loss = 0
 
-                        loss = rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss
+                        loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss)
 
-                        total_loss += loss.item()
-                    else:
-                        visual_feats, spk_emb, masked_spec, spec, mask = batch
+                    elif self.mode == 'v':
+
+                        masked_spec = masked_spec.float().to(self.device)
+                        visual_feats = visual_feats.float().to(self.device)
+                        spk_emb = spk_emb.float().to(self.device)
+                        spec = spec.float().to(self.device)
+
+                        rec_spec = self.model(visual_feats, spk_emb)
+                        synth_loss = self.rec_criterion(rec_spec, spec)
+
+                        if self.l2s_loss:
+                            sc_loss = self.sc_criterion(rec_spec, spec)
+                        else:
+                            sc_loss = 0.0
+
+                        if self.pesq_loss:
+                            pmsqe_loss = torch.mean(
+                                self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                                    torch_mel2spec(spec).permute(0, 2, 1)))
+                        else:
+                            pmsqe_loss = 0
+
+                        loss = (sc_loss + synth_loss + self.w_pmsqe * pmsqe_loss)
+
+                    elif self.mode == 'av':
 
                         visual_feats = visual_feats.float().to(self.device)
                         spk_emb = spk_emb.float().to(self.device)
                         masked_spec = masked_spec.float().to(self.device)
                         spec = spec.float().to(self.device)
 
-                        if self.l2s_loss:
-                            rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
-                            rec_loss = self.rec_criterion(rec_spec, spec)
-                            synth_loss = self.synth_criterion(synth_spec, spec)
+                        rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
+                        rec_loss = self.rec_criterion(rec_spec, spec)
+                        synth_loss = self.rec_criterion(synth_spec, spec)
 
+                        if self.l2s_loss:
+                            sc_loss = self.sc_criterion(synth_spec, spec)
                         else:
-                            rec_spec = self.model(masked_spec, visual_feats, spk_emb)
-                            rec_loss = self.rec_criterion(rec_spec)
-                            synth_loss = 0
+                            sc_loss = 0.0
 
                         if self.pesq_loss:
                             pmsqe_loss = torch.mean(
-                                self.pesq_criterion(torch.exp(rec_spec).permute(0, 2, 1),
-                                                    torch.exp(spec).permute(0, 2, 1)))
+                                self.pesq_criterion(torch_mel2spec(rec_spec).permute(0, 2, 1),
+                                                    torch_mel2spec(spec).permute(0, 2, 1)))
                         else:
                             pmsqe_loss = 0
 
-                        loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * synth_loss)
-                        total_loss += loss.item()
+                        loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * (synth_loss + sc_loss))
+
+                    total_loss += loss.item()
 
                     #if batch_idx == 0 or batch_idx == 100 or batch_idx == 200:
                     if batch_idx == 100:
@@ -764,22 +943,18 @@ class Trainer:
                                 original_audio = torch_mel_to_audio(spec[i].cpu(), None)
                                 masked_audio = torch_mel_to_audio(masked_spec[i].cpu(), None)
                                 reconstructed_audio = torch_mel_to_audio(rec_spec[i].cpu(), None)
-                                Synthesized_audio = torch_mel_to_audio(synth_spec[i].cpu(), None)
                             else:
                                 original_audio = self.vocoder.convert(spec[i])
                                 masked_audio = self.vocoder.convert(masked_spec[i])
                                 reconstructed_audio = self.vocoder.convert(rec_spec[i])
-                                Synthesized_audio = self.vocoder.convert(synth_spec[i])
 
                             original_audio = original_audio.cpu().numpy()
                             masked_audio = masked_audio.cpu().numpy()
                             reconstructed_audio = reconstructed_audio.cpu().numpy()
-                            Synthesized_audio = Synthesized_audio.cpu().numpy()
 
                             spec_np = spec[i].cpu().numpy()
                             masked_spec_np = masked_spec[i].cpu().numpy()
                             rec_spec_np = rec_spec[i].cpu().numpy()
-                            synth_spec_np = synth_spec[i].cpu().numpy()
 
                             sample_metrics = calculate_metrics(spec[i],
                                                                rec_spec[i],
@@ -844,13 +1019,13 @@ class Trainer:
                     all_masked.append(masked_spec)
                     all_reconstructed.append(rec_spec)
 
-                    if self.l2s_loss:
+                    if self.mode == 'av':
                         #batch_synth = synth_spec.cpu().numpy()
                         all_synth.append(synth_spec)
 
                     if (batch_idx + 1) % 40 == 0 or (batch_idx + 1) == len(test_loader):
 
-                        if self.l2s_loss:
+                        if self.mode == 'av':
                             all_synth = torch.concatenate(all_synth, dim=0)
 
                         all_original = torch.concatenate(all_original, dim=0)

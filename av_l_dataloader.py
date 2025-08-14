@@ -5,18 +5,18 @@ from av_l_dataset import AVDataset
 
 class AVDataloader:
     def __init__(self, dataset_name, mode, batch_size, num_workers,
-                 train_subset=None, val_subset=None, test_subset=None):
+                 train_subset=1000, val_subset=None, test_subset=None):
 
         assert dataset_name in ['grid', 'voxceleb2'], f"Invalid dataset_name: {dataset_name}"
 
         if dataset_name == 'grid':
-            base_path = 'datasets/grid/'
+            base_path = '/home/ai/Projects/Mahsa/datasets/grid/' #'datasets/grid/'
             self.train_files = base_path + 'grid_train_features_chunk*.h5'
             self.val_files = base_path + 'grid_val_features_chunk*.h5'
             self.test_files = base_path + 'grid_test_features_chunk*.h5'
 
         elif dataset_name == 'voxceleb2':
-            base_path = 'datasets/vox2_short/'
+            base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
             self.train_files = base_path + 'vox2_short_dev_features_chunk*.h5'
             self.val_files = base_path + 'vox2_short_val_features_chunk*.h5'
             self.test_files = base_path + 'vox2_short_test_features_chunk*.h5'
@@ -88,7 +88,7 @@ class AVDataloader:
                           worker_init_fn=self.worker_init_fn)
 
     def av_collate_fn(self, batch):
-        if self.mode == 'v':
+        if self.mode == 'v' or self.mode == 'av':
             frames, spk_embs, masked_specs, mel_specs, masks = zip(*batch)
 
             processed_frames = []
@@ -104,11 +104,43 @@ class AVDataloader:
 
             frames = torch.stack(processed_frames)  # [B, 75, C, H, W]
             spk_embs = torch.stack([torch.as_tensor(s) for s in spk_embs])
-            masked_specs = torch.stack(masked_specs)
-            mel_specs = torch.stack(mel_specs)
-            masks = torch.stack(masks)
+            masked_specs = torch.stack([torch.as_tensor(masked_spec) for masked_spec in masked_specs])
+            mel_specs = torch.stack([torch.as_tensor(mel_spec) for mel_spec in mel_specs])
+            masks = torch.stack([torch.as_tensor(mask) for mask in masks])
+            #masked_frames = self.apply_audio_mask_to_video(frames, masks)
 
             return frames, spk_embs, masked_specs, mel_specs, masks
+            #return masked_frames, spk_embs, masked_specs, mel_specs, masks
+
+    def apply_audio_mask_to_video(self, videos: torch.Tensor, audio_masks: torch.Tensor, threshold: float = 0.5):
+
+        masked_videos = []
+        for audio_mask, video in zip(audio_masks, videos):
+
+            T_v = video.shape[0]  # 75
+
+            # 1. Collapse mel bins to temporal dimension
+            time_mask = audio_mask.min(dim=0).values.float()  # [300], 1 = all OK, 0 = any lost
+
+            # 2. Reshape to [1, 1, 300] for pooling
+            time_mask = time_mask.view(1, 1, -1)  # [1, 1, 300]
+
+            # 3. Invert mask: 1 = lost, 0 = OK
+            inverted = 1.0 - time_mask
+
+            # 4. Detect any loss in group via max_pool1d
+            pooled = torch.nn.functional.max_pool1d(inverted, kernel_size=4, stride=4)  # [1, 1, 75]
+
+            # 5. Invert again: 1 = OK, 0 = loss
+            downsampled_mask = 1.0 - pooled.view(T_v)  # [75]
+
+            # 6. Expand to video frame shape
+            video_mask = downsampled_mask[:, None, None, None].expand(video.shape)  # [75, 1, 112, 112]
+
+            masked_video = video * video_mask
+            masked_videos.append(masked_video)
+
+        return torch.stack(masked_videos)
 
     def __repr__(self) -> str:
         return (

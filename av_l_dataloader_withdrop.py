@@ -10,7 +10,7 @@ class AVDataloader:
         assert dataset_name in ['grid', 'voxceleb2'], f"Invalid dataset_name: {dataset_name}"
 
         if dataset_name == 'grid':
-            base_path = '/home/ai/Projects/Mahsa/datasets/grid/' #'datasets/grid/'
+            base_path = 'datasets/' #'datasets/grid/'
             self.train_files = base_path + 'grid_train_features_chunk*.h5'
             self.val_files = base_path + 'grid_val_features_chunk*.h5'
             self.test_files = base_path + 'grid_test_features_chunk*.h5'
@@ -46,8 +46,8 @@ class AVDataloader:
                           batch_size=self.batch_size,
                           shuffle=True,
                           num_workers=self.num_workers,
-                          pin_memory=True,
-                          collate_fn=self.av_collate_fn,)
+                          pin_memory=True,)
+                          #collate_fn=self.av_collate_fn,)
                           #worker_init_fn=self.worker_init_fn)
 
     def val_dataloader(self):
@@ -62,8 +62,8 @@ class AVDataloader:
                           shuffle=False,
                           num_workers=self.num_workers,
                           pin_memory=True,
-                          drop_last=True,
-                          collate_fn=self.av_collate_fn,)
+                          drop_last=True,)
+                          #collate_fn=self.av_collate_fn,)
                           #worker_init_fn=self.worker_init_fn)
 
     def test_dataloader(self, mask_range):
@@ -84,7 +84,7 @@ class AVDataloader:
                           num_workers=self.num_workers,
                           pin_memory=True,
                           drop_last=True,
-                          collate_fn=self.av_collate_fn,
+                          #collate_fn=self.av_collate_fn,
                           worker_init_fn=self.worker_init_fn)
 
     def av_collate_fn(self, batch):
@@ -151,3 +151,44 @@ class AVDataloader:
             f"]>"
         )
 
+if __name__ == "__main__":
+
+    import h5py
+    import glob
+    import numpy as np
+    from tqdm import tqdm
+
+    def process_single_chunk_filter(chunk_file):
+
+        with h5py.File(chunk_file, 'r+') as h5f:
+            video_keys = list(h5f.keys())
+            for video_key in tqdm(video_keys, desc=f"{os.path.basename(chunk_file)}"):
+                video_path = h5f.attrs.get(f"{video_key}/video_path", None)
+                if video_path is not None:
+                    try:
+                        frames = h5f[f"{video_key}/frames"][:]
+
+                        valid = np.any(frames != 0, axis=(1, 2, 3))
+                        frames_valid = frames[valid]
+
+                        if frames_valid.shape[0] == 0:
+                            print(f"Corrupted Video: {video_path}")
+                            del h5f[video_key]
+
+                    except Exception as e:
+                        print(f"General error for {video_key}: {e}")
+                else:
+                    print(f"Warning: No video path found for {video_key}")
+
+
+    def update_h5(base_path, chunk_pattern="_chunk*.h5"):
+        chunk_files = sorted(glob.glob(f"{base_path}{chunk_pattern}"))
+        for chunk_file in chunk_files:
+            process_single_chunk_filter(chunk_file)
+
+
+    splits = {"dev"}  # "train"/"dev", "val", "test"
+
+    for split in splits:
+        feats_path = f'/home/ai/Projects/Mahsa/datasets/vox2_short/vox2_short_{split}_features'
+        update_h5(feats_path)

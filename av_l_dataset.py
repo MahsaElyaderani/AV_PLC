@@ -4,6 +4,8 @@
  Lazy conversion returns numpy then batch and convert → much safer."""
 
 import os
+
+import cv2
 import h5py
 import numpy as np
 from glob import glob
@@ -14,16 +16,19 @@ import torch
 import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 
+from av_augmentation import Compose, RandomCrop, RandomErase, TimeMask, HorizontalFlip
 
 VALID_MODES = {'a', 'v', 'av', 'motion'}
 VALID_MASK_RANGES = {'20', '30', '40', '50', '60', 'rand'}
 
 
 class AVDataset(Dataset):
-    def __init__(self, base_path, mode='v', mask_range='rand', chunk_pattern="_chunk*.h5"):
+    def __init__(self, base_path, mode='v', mask_range='rand',
+                 augment=True, chunk_pattern="_chunk*.h5"):
         self._validate_args(mode, mask_range)
 
         self.mode = mode
+        self.augment = augment
         self.mask_range = mask_range
 
         self.chunk_files = sorted(glob(base_path if chunk_pattern in base_path else os.path.join(base_path, chunk_pattern)))
@@ -40,12 +45,30 @@ class AVDataset(Dataset):
 
         print(f"AVDataset initialized with {len(self.index_map)} samples from {len(self.chunk_files)} chunks.")
 
+        if self.augment:
+            self.video_aug = Compose([
+                #RandomCrop((88, 88)),
+                HorizontalFlip(0.5),
+                RandomErase(0.5),
+                TimeMask()
+            ])
+
         self.video_transform = T.Compose([
             T.Resize((112, 112)),
             T.Grayscale(num_output_channels=1),
             T.ToTensor(),
             T.Normalize(mean=0.421, std=0.165),
         ])
+
+        if 'grid' in base_path:
+            self.mel_mean = -56.775
+            self.mel_std = 19.707
+        elif 'vox2' in base_path:
+            self.mel_mean = -52.43
+            self.mel_std = 17.499
+        else:
+            self.mel_mean = -54.60
+            self.mel_std = 18.60
 
         self._h5_cache = {}
 
@@ -68,7 +91,7 @@ class AVDataset(Dataset):
             self._h5_cache[chunk_idx] = h5py.File(self.chunk_files[chunk_idx], 'r', swmr=True)
         return self._h5_cache[chunk_idx]
 
-    def close(self):
+    def close_h5_files(self):
         for f in self._h5_cache.values():
             f.close()
         self._h5_cache.clear()
@@ -77,11 +100,11 @@ class AVDataset(Dataset):
         chunk_idx, video_key = self.index_map[idx]
         h5f = self._get_h5_file(chunk_idx)
 
-        mel_spec = torch.tensor(h5f[f"{video_key}/mel_spec"][:], dtype=torch.float32)
+        mel_spec = h5f[f"{video_key}/spec"][:]
         text = h5f[f"{video_key}/text"][:]
         mask = h5f[f"{video_key}/mask"][:] if self.mask_range == 'rand' else h5f[f"{video_key}/mask_{self.mask_range}"][:]
-        mask = torch.tensor(mask, dtype=torch.float32)
-        mel_spec = torch.nn.functional.layer_norm(mel_spec, mel_spec.shape)
+
+        mel_spec = (mel_spec - self.mel_mean) / self.mel_std
         masked_spec = mel_spec * mask
 
         if self.mode == 'a':
@@ -95,10 +118,11 @@ class AVDataset(Dataset):
             padded[:len(motions)] = motions
             return masked_spec, torch.tensor(padded), mel_spec, text, mask
 
-        elif self.mode == 'v':
+        elif self.mode == 'v' or self.mode == 'av':
             frames = h5f[f"{video_key}/frames"][:]
             spk_emb = h5f[f"{video_key}/spkr_embd"][:]
             frames = self._process_video_frames(frames)
+
             return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
 
         raise NotImplementedError(f"Unsupported mode: {self.mode}")
@@ -111,8 +135,13 @@ class AVDataset(Dataset):
         valid = np.any(frames_np != 0, axis=(1, 2, 3))
         frames_np = frames_np[valid]
 
+        frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) for frame in frames_np]
+        frames = np.array(frames)
+        if self.augment:
+            frames = self.video_aug(frames)
+
         processed = []
-        for f in frames_np:
+        for f in frames:
             img = Image.fromarray(f.astype(np.uint8))
             processed.append(self.video_transform(img))
 
@@ -120,20 +149,47 @@ class AVDataset(Dataset):
 
 if __name__ == "__main__":
 
+    import math
+    from av_l_dataloader import AVDataloader
 
-    # base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
-    # path = base_path + 'vox2_short_test_features_chunk*.h5'
+    #base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
+    #path = base_path + 'vox2_short_test_features_chunk*.h5'
 
-    base_path = '/home/ai/Projects/Mahsa/datasets/grid/' #'datasets/grid/'
-    path = base_path + 'grid_test_features_chunk*.h5'
+    #base_path = '/home/ai/Projects/Mahsa/datasets/grid/' #'datasets/grid/'
+    #path = base_path + 'grid_train_features_chunk*.h5'
 
-    dataset = AVDataset(path, mode='v', mask_range='60')
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+    #dataset = AVDataset(path, mode='v', mask_range='rand')
+    #dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    dataset_name = 'voxceleb2' #'grid'
+    av_loader = AVDataloader(dataset_name, 'v', 32, 8)
+    dataloader = av_loader.train_dataloader()
     print(len(dataloader))
+
+    sum_val = 0.0
+    sum_sqr_val = 0.0
+    count = 0
+
     for frames, spk_emb, masked_spec, mel_spec, mask in dataloader:
-        print(frames.shape)
-        print(mel_spec[0].shape)
+        #plt.imshow(frames[0,60,0,:,:])
         #plt.imshow(mel_spec[0])
-        plt.imshow(frames[0, 30,0, ...])
-        plt.show()
+        #plt.show()
+        print(frames.shape)
+        # mel_spec: [B, F, T] or [B, 1, F, T]
+        num_elements = mel_spec.numel()  # total elements in the batch
+
+        sum_val += mel_spec.sum().item()
+        sum_sqr_val += (mel_spec ** 2).sum().item()
+        count += num_elements
+
+    global_mean = sum_val / count
+    global_var = (sum_sqr_val / count) - (global_mean ** 2)
+    #global_var = max(global_var, 0.0)  # avoid small negatives
+    global_std = math.sqrt(global_var)
+
+    print(f"Mean: {global_mean}, std: {global_std}")
+
+    with open("voxceleb2_mel_stats.txt", "w") as f:
+        f.write(f"global mean of {dataset_name}: {global_mean}\n")
+        f.write(f"global std of {dataset_name}: {global_std}\n")
 

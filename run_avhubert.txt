@@ -1,0 +1,8 @@
+cd /Users/kadkhodm/PycharmProjects/speech_inpainting
+chmod +x setup_avhubert.sh
+
+bash setup_avhubert.sh --env avhubert_env --python 3.9 \
+  --ckpt "/Users/kadkhodm/PycharmProjects/speech_inpainting/checkpoints/avhubert_base_vox_iter5.pt"
+
+conda activate avhubert_env
+python your_feature_script.py

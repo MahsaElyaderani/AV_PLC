@@ -3,23 +3,50 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
+
 from conformer import Conformer
 
-from resnet import ResNetModel
-from av_l_dataloader import AVDataloader
-from trainer import Trainer, setup_logging
+from resnet_ import ResNetModel
+from av_l_dataloader_withdrop import AVDataloader
+from trainer_withdrop import Trainer, setup_logging
 
-class AttentionBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, masking=True):
-        super(AttentionBlock, self).__init__()
-        self.masking = masking
-        self.multihead_attn = nn.MultiheadAttention(hidden_size, num_heads=num_heads,
-                                                    batch_first=True, dropout=0.1)
 
-    def forward(self, x_in, kv_in, key_mask=None):
-        attn_out = self.multihead_attn(x_in, kv_in, kv_in,
-                                   attn_mask=None, key_padding_mask=key_mask)[0]
-        return attn_out
+class FusionModule(nn.Module):
+    def __init__(self, audio_dim=80):
+        super(FusionModule, self).__init__()
+
+        self.fusion_module = Conformer(
+            dim=80,
+            depth=2,
+            dim_head=64,
+            heads=4,
+            ff_mult=4,
+            conv_expansion_factor=2,
+            conv_kernel_size=31,
+            attn_dropout=0.1,
+            ff_dropout=0.1,
+            conv_dropout=0.1
+        )
+
+        self.mel_proj = nn.Linear(80, 80)
+        self.frame_proj = nn.Linear(80, 80)
+
+    def forward(self, audio, video, training=False):
+
+        t_a = audio.size(1)
+
+        fused = torch.cat([audio, video], dim=1)  # [b, t, dim]
+        output = self.fusion_module(fused)
+
+        audio_output = output[:, :t_a, :]
+        audio_output = self.mel_proj(audio_output)
+
+        video_output = output[:, t_a:, :]
+        video_output = self.frame_proj(video_output)
+
+        return audio_output, video_output
+
 
 
 class Video_Encoder(nn.Module):
@@ -28,7 +55,8 @@ class Video_Encoder(nn.Module):
         super(Video_Encoder, self).__init__()
 
         self.frontend = nn.Sequential(
-            nn.Conv3d(1, 64, kernel_size=(5, 7, 7), stride=(1, 2, 2), padding=(2, 3, 3), bias=False),
+            nn.Conv3d(1, 64, kernel_size=(5, 7, 7),
+                      stride=(1, 2, 2), padding=(2, 3, 3), bias=False),
             nn.BatchNorm3d(64),
             nn.ReLU(True),
             nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
@@ -91,9 +119,9 @@ class Audio_Decoder(nn.Module):
             ff_mult=4,
             conv_expansion_factor=2,
             conv_kernel_size=31, #15
-            attn_dropout=dropout, #0.
-            ff_dropout=dropout, #0.
-            conv_dropout=dropout #0.
+            attn_dropout=dropout,
+            ff_dropout=dropout,
+            conv_dropout=dropout
         )
 
         self.norm_layer = nn.LayerNorm(hidden_size)
@@ -103,6 +131,7 @@ class Audio_Decoder(nn.Module):
         x = x.permute(0, 2, 1)
         x = self.audio_emb(x)
         x = self.conformer(x)
+        #x = self.fc_out(x)
         x = self.norm_layer(x)
         x = self.mel_proj(x)
         return x.permute(0, 2, 1)
@@ -110,7 +139,7 @@ class Audio_Decoder(nn.Module):
 
 class AV_ReVoice(nn.Module):
     def __init__(self, l2s_loss=False, hidden_size=256,
-                 dropout=0.1, num_heads=1,):
+                 mel_dim=80, dropout=0.1, num_heads=1,):
         super(AV_ReVoice, self).__init__()
 
         self.hidden_size = hidden_size
@@ -122,42 +151,39 @@ class AV_ReVoice(nn.Module):
         if self.l2s_loss:
             self.video_enc = Video_Encoder()
             video_checkpoint_path = 'checkpoints/video_plc_sc(grid)/best_model.pt'
+            #video_checkpoint_path = 'checkpoints/video_plc_reg_sc(grid)/best_model.pt'
+            #video_checkpoint_path = 'checkpoints/video_plc_reg_aug_sc(grid)/best_model.pt'
             video_best_checkpoint = torch.load(video_checkpoint_path)
             self.video_enc.load_state_dict(video_best_checkpoint['model_state_dict'])
 
             self.audio_dec = Audio_Decoder(mel_emb=1*80)
+            self.fusion_module = FusionModule()
 
-            self.mel_conv = nn.Sequential(
-                nn.Conv1d(in_channels=2 * 80, out_channels=80,
-                          kernel_size=3, stride=1, padding=1),
-                nn.Dropout(0.1),
-                nn.GELU(),
-                nn.Conv1d(in_channels=80, out_channels=80,
-                          kernel_size=3, stride=1, padding=1),
-                nn.Dropout(0.1),
-                nn.GELU(),
-                nn.Conv1d(in_channels=80, out_channels=80,
-                          kernel_size=3, stride=1, padding=1),
-                nn.Dropout(0.1),
-                nn.GELU(),
-            )
         else:
             self.audio_dec = Audio_Decoder(mel_emb=80)
 
         audio_checkpoint_path = 'checkpoints/audio_plc_pesq_0.01(grid)/best_model.pt'
         best_audio_checkpoint = torch.load(audio_checkpoint_path)
+        #consume_prefix_in_state_dict_if_present(best_audio_checkpoint['model_state_dict'], "audio_dec.")
+        #audio_state = self.filter_state_keys(self.audio_dec, best_audio_checkpoint['model_state_dict'])
         self.audio_dec.load_state_dict(best_audio_checkpoint['model_state_dict'])
+
+    def filter_state_keys(self, model, checkpoint):
+        #checkpoint = torch.load(checkpoint_path)
+        model_state = model.state_dict()
+        # Filter keys
+        clean_state = {k: v for k, v in checkpoint.items() if k in model_state}
+        #model.load_state_dict(clean_state, strict=False)
+        return clean_state
 
     def forward(self, dec_input, enc_input, spk_emb):
 
         if self.l2s_loss:
-            x = self.video_enc(enc_input, spk_emb) # [b, d_a=80, t_a]
-            y = torch.cat((dec_input.permute(0, 2, 1), x.permute(0, 2, 1)),-1) #[b, t_a, 2*d_a=160]
-
-            y = self.mel_conv(y.permute(0, 2, 1)) # [b, c, t]
-            y = self.audio_dec(y)
-
-            return y, x
+            x = self.video_enc(enc_input, spk_emb) # output shape: [b, d_a=80, t_a]
+            y = self.audio_dec(dec_input)# output shape: [b, d_a=80, t_a]
+            audio_output, video_output = self.fusion_module(y.permute(0, 2, 1),
+                                                            x.permute(0, 2, 1))  # [b, t_a=200, 2*d_a=160]
+            return audio_output.permute(0, 2, 1), x #video_output.permute(0, 2, 1)
         else:
             y = self.audio_dec(dec_input)
 
@@ -168,7 +194,7 @@ if __name__ == "__main__":
 
     batch_size = 16
     num_epochs = 200
-    learning_rate = 0.00001
+    learning_rate = 0.0001
 
     pesq_flag = True
     l2s_flags = [True]
@@ -185,7 +211,7 @@ if __name__ == "__main__":
 
     for dataset_name in dataset_names:
         for l2s_flag in l2s_flags:
-                model_name = f"av_plc_s2s_conv{'_sc' if l2s_flag else ''}{'_pesq' if pesq_flag else ''}({dataset_name})"
+                model_name = f"av_plc_withdrop{'_sc' if l2s_flag else ''}{'_pesq' if pesq_flag else ''}({dataset_name})"
                 logger = setup_logging(model_name, log_dir)
                 logger.info(f"Using device: {device}")
 
@@ -217,9 +243,9 @@ if __name__ == "__main__":
                     log_dir=log_dir
                 )
 
-                logger.info(f"Starting training for {num_epochs} epochs...")
-                start_epoch = trainer.load_checkpoint(load_best=True)
-                trainer.train(num_epochs=num_epochs, start_epoch=start_epoch)
+                # logger.info(f"Starting training for {num_epochs} epochs...")
+                # start_epoch = trainer.load_checkpoint(load_best=False)
+                # trainer.train(num_epochs=num_epochs, start_epoch=start_epoch)
 
                 for plc_loss_rate in plc_loss_rates:
                     test_loader = av_dataloader.test_dataloader(plc_loss_rate)

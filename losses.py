@@ -49,7 +49,7 @@ class SVTS_Loss(torch.nn.Module):
         self.spectral_convergence_loss = SpectralConvergenceLoss()
 
     def forward(self, preds, gts):
-        return self.l1_loss(gts, preds) + self.spectral_convergence_loss(gts, preds)
+        return self.l1_loss(preds, gts) + self.spectral_convergence_loss(preds, gts)
 
 
 class L1Loss(torch.nn.Module):
@@ -60,7 +60,7 @@ class L1Loss(torch.nn.Module):
         super().__init__()
         self.l1_loss = torch.nn.L1Loss()
 
-    def forward(self, gts, preds):
+    def forward(self, preds, gts):
         batch_loss = 0
         for gt, pred in zip(gts, preds):
             batch_loss += (self.l1_loss(gt, pred))  # higher weight = minority = high error
@@ -77,7 +77,7 @@ class SpectralConvergenceLoss(torch.nn.Module):
         super().__init__()
         self.norm_f = torch.linalg.norm
 
-    def forward(self, gts, preds):
+    def forward(self, preds, gts):
         batch_loss = 0
         for gt, pred in zip(gts, preds):
             loss = (self.norm_f(gt - pred, ord='fro') / self.norm_f(gt, ord='fro'))

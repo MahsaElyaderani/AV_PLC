@@ -1,0 +1,47 @@
+name: torch_env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  # Core
+  - python=3.11
+  - pip
+
+  # PyTorch (macOS uses Metal/MPS; no CUDA packages)
+  - pytorch=2.3.*
+  - torchvision=0.18.*
+  - torchaudio=2.3.*
+
+  # Numerics & Sci
+  - numpy
+  - scipy
+  - scikit-learn
+  - pandas
+
+  # IO & plotting
+  - h5py
+  - matplotlib
+  - jupyterlab
+  - ipykernel
+
+  # Media / codecs
+  - ffmpeg
+
+  # Utilities
+  - tqdm
+  - pyyaml
+
+  # Install the rest via pip (Mac/arm64-safe picks shown)
+  - pip:
+      - librosa
+      - soundfile
+      - soxr
+      - pesq               # builds on macOS; may take a minute
+      - pystoi
+      - mediapipe
+      - opencv-python
+      - einops
+      - sentencepiece
+      - transformers
+      - accelerate

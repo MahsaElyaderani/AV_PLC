@@ -43,7 +43,7 @@ class AVDataset(Dataset):
 
         self.video_transform = T.Compose([
             T.Resize((112, 112)),
-            T.Grayscale(num_output_channels=1),
+            #T.Grayscale(num_output_channels=1),
             T.ToTensor(),
             T.Normalize(mean=0.421, std=0.165),
         ])
@@ -54,6 +54,12 @@ class AVDataset(Dataset):
         if 'grid' in base_path:
             self.mel_mean = -56.775
             self.mel_std = 19.707
+        elif 'vox2' in base_path:
+            self.mel_mean = -52.43
+            self.mel_std = 17.499
+        else:
+            self.mel_mean = -54.60
+            self.mel_std = 18.60
 
         self._h5_cache = {}
 
@@ -112,7 +118,7 @@ class AVDataset(Dataset):
 
         elif self.mode == 'av':
 
-            spk_emb = h5f[f"{video_key}/spkr_embed"][:]
+            spk_emb = h5f[f"{video_key}/spkr_embd"][:]
 
             if 'train' in video_path:
                 mode = self.modality_dropout.sample_mode()
@@ -149,7 +155,8 @@ class AVDataset(Dataset):
 
         processed = []
         for f in frames_np:
-            img = Image.fromarray(f.astype(np.uint8))
+            #img = Image.fromarray(f.astype(np.uint8))
+            img = Image.fromarray(f[..., 0])
             processed.append(self.video_transform(img))
 
         frames = torch.stack(processed)
@@ -163,13 +170,13 @@ if __name__ == "__main__":
     # base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
     # path = base_path + 'vox2_short_test_features_chunk*.h5'
 
-    base_path = '/home/ai/Projects/Mahsa/datasets/grid/' #'datasets/grid/'
-    path = base_path + 'grid_train_features_chunk*.h5'
+    #base_path = '/home/ai/Projects/Mahsa/datasets/grid/' #'datasets/grid/'
+    #path = base_path + 'grid_train_features_chunk*.h5'
 
     #dataset = AVDataset(path, mode='v', mask_range='rand')
     #dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    dataset_name = 'grid'
+    dataset_name = 'voxceleb2'
     av_loader = AVDataloader(dataset_name, 'v', 32, 8)
     dataloader = av_loader.train_dataloader()
     print(len(dataloader))
@@ -179,8 +186,8 @@ if __name__ == "__main__":
     count = 0
 
     for frames, spk_emb, masked_spec, mel_spec, mask in dataloader:
-        plt.imshow(frames[0,60,0,:,:])
-        plt.show()
+        #plt.imshow(frames[0,60,0,:,:])
+        #plt.show()
         # mel_spec: [B, F, T] or [B, 1, F, T]
         num_elements = mel_spec.numel()  # total elements in the batch
 
@@ -195,7 +202,7 @@ if __name__ == "__main__":
 
     print(f"Mean: {global_mean}, std: {global_std}")
 
-    with open("mel_stats.txt", "w") as f:
+    with open("voxceleb2_mel_stats.txt", "w") as f:
         f.write(f"global mean of {dataset_name}: {global_mean}\n")
         f.write(f"global std of {dataset_name}: {global_std}\n")
 
