@@ -4,6 +4,7 @@
  Lazy conversion returns numpy then batch and convert → much safer."""
 
 import os
+import gc
 import h5py
 import numpy as np
 from glob import glob
@@ -73,12 +74,13 @@ class AVDataset(Dataset):
         return len(self.index_map)
 
     def _get_h5_file(self, chunk_idx):
-        MAX_OPEN_FILES = 20
+        MAX_OPEN_FILES = 5
         if chunk_idx not in self._h5_cache:
             if len(self._h5_cache) >= MAX_OPEN_FILES:
                 old = next(iter(self._h5_cache))
                 self._h5_cache[old].close()
                 del self._h5_cache[old]
+                gc.collect()
             self._h5_cache[chunk_idx] = h5py.File(self.chunk_files[chunk_idx], 'r', swmr=True)
         return self._h5_cache[chunk_idx]
 
@@ -150,8 +152,8 @@ class AVDataset(Dataset):
         video frames shape: [T, H, W, C].
         process video frames shape [T, C, H, W].
         """
-        valid = np.any(frames_np != 0, axis=(1, 2, 3))
-        frames_np = frames_np[valid]
+        #valid = np.any(frames_np != 0, axis=(1, 2, 3))
+        #frames_np = frames_np[valid]
 
         processed = []
         for f in frames_np:

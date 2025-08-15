@@ -6,7 +6,7 @@ from torch.nn.utils import remove_weight_norm, weight_norm
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from typing import Tuple
 
-from stable_diffusion.dataset.hifigan.hifigan.utils import get_padding
+from hifigan.hifigan.utils import get_padding
 
 LRELU_SLOPE = 0.1
 

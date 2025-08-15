@@ -47,7 +47,8 @@ class AVDataloader:
                           shuffle=True,
                           num_workers=self.num_workers,
                           pin_memory=True,)
-                          #collate_fn=self.av_collate_fn,)
+                          #collate_fn=self.av_collate_fn,
+                          # prefetch_factor=2,)
                           #worker_init_fn=self.worker_init_fn)
 
     def val_dataloader(self):

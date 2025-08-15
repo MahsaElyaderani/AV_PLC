@@ -320,11 +320,13 @@ class Trainer:
         train_iterator = tqdm(self.train_loader,
                               desc=f"Epoch {epoch + 1}/{num_epochs} [Train]",
                               leave=False, unit="batch")
-
+        batch_start_time = time.time()
         for batch_idx, batch in enumerate(train_iterator):
 
-            if batch_idx % 10 == 0:
+            batch_load_time = time.time() - batch_start_time
+            if batch_idx % 20 == 0:
                 torch.cuda.empty_cache()
+                gc.collect()
 
             visual_feats, spk_emb, masked_spec, spec, mask = batch
 
@@ -370,12 +372,17 @@ class Trainer:
 
             elif self.mode == 'av':
 
+                feature_map_start_time = time.time()
                 visual_feats = visual_feats.float().to(self.device)
                 spk_emb = spk_emb.float().to(self.device)
                 masked_spec = masked_spec.float().to(self.device)
                 spec = spec.float().to(self.device)
+                feature_map_time = time.time() - feature_map_start_time
 
+                forward_start_time = time.time()
                 rec_spec, synth_spec = self.model(masked_spec, visual_feats, spk_emb)
+                forward_time = time.time() - forward_start_time
+                loss_calc_start_time = time.time()
                 rec_loss = self.rec_criterion(rec_spec, spec)
                 synth_loss = self.rec_criterion(synth_spec, spec)
 
@@ -392,12 +399,15 @@ class Trainer:
                     pmsqe_loss = 0
 
                 loss = (rec_loss + self.w_pmsqe * pmsqe_loss + self.w * (synth_loss + sc_loss))
-
+                loss_calc_time = time.time() - loss_calc_start_time
+            optimizer_start_time = time.time()
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if batch_idx % 3 == 0:
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
-
+            optimizer_time = time.time() - optimizer_start_time
+            post_optimizer_start_time = time.time()
             train_loss += loss.item()
             current_lr = self.optimizer.param_groups[0]['lr']
 
@@ -413,6 +423,14 @@ class Trainer:
 
             self.train_step += 1
             self.global_step += 1
+            post_optimizer_time = time.time() - post_optimizer_start_time
+            # log detailed timing information every batche
+            if (batch_idx > 0) and (batch_idx % 10 == 0):
+                self.logger.info(
+                    f"Batch {batch_idx}: load {batch_load_time:.3f}s, feature_map {feature_map_time:.3f}s, "
+                    f"forward {forward_time:.3f}s, loss_calc {loss_calc_time:.3f}s, "
+                    f"optimize {optimizer_time:.3f}s, post_optimize {post_optimizer_time:.3f}s"
+                )
 
         avg_train_loss = train_loss / len(self.train_loader)
         return avg_train_loss
@@ -434,7 +452,7 @@ class Trainer:
 
                 try:
 
-                    if batch_idx % 5 == 0:
+                    if batch_idx % 50 == 0:
                         torch.cuda.empty_cache()
 
                     visual_feats, spk_emb, masked_spec, spec, mask = batch
