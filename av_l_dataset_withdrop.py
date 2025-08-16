@@ -42,13 +42,6 @@ class AVDataset(Dataset):
 
         print(f"AVDataset initialized with {len(self.index_map)} samples from {len(self.chunk_files)} chunks.")
 
-        self.video_transform = T.Compose([
-            T.Resize((112, 112)),
-            #T.Grayscale(num_output_channels=1),
-            T.ToTensor(),
-            T.Normalize(mean=0.421, std=0.165),
-        ])
-
         if mode == 'av':
             self.modality_dropout = ModalityDropout()
 
@@ -89,7 +82,16 @@ class AVDataset(Dataset):
             f.close()
         self._h5_cache.clear()
 
+    def _process_video_frames(self, frames):
+        # fr: (T,H,W,1) or (T,H,W) uint8
+        if frames.ndim == 3: frames = frames[..., None]
+        frames = frames.astype(np.float32) / 255.0  # [0,1]
+        frames = (frames - 0.421) / 0.165  # normalize
+        frames = np.transpose(frames, (0, 3, 1, 2))  # (T,1,H,W)
+        return frames
+
     def __getitem__(self, idx):
+
         chunk_idx, video_key = self.index_map[idx]
         h5f = self._get_h5_file(chunk_idx)
 
@@ -109,14 +111,14 @@ class AVDataset(Dataset):
             motions = np.diff(landmarks[valid], axis=0)
             padded = np.zeros_like(landmarks)
             padded[:len(motions)] = motions
-            return masked_spec, torch.tensor(padded), mel_spec, text, mask
+            return masked_spec, padded, mel_spec, text, mask
 
         elif self.mode == 'v':
             frames = h5f[f"{video_key}/frames"][:]
             spk_emb = h5f[f"{video_key}/spkr_embed"][:]
             frames = self._process_video_frames(frames)
 
-            return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
+            return frames, spk_emb, masked_spec, mel_spec, mask
 
         elif self.mode == 'av':
 
@@ -128,47 +130,47 @@ class AVDataset(Dataset):
                 if mode == 'audio_video':
                     frames = h5f[f"{video_key}/frames"][:]
                     frames = self._process_video_frames(frames)
-                    return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
+                    return frames, spk_emb, masked_spec, mel_spec, mask
 
                 elif mode == 'audio_only':
-                    frames = torch.zeros((75, 1, 112, 112))
-                    return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
+                    frames = np.zeros((75, 1, 112, 112), dtype=np.float32)  # Assuming 75 frames of size 112x112 with 1 channel
+                    return frames, spk_emb, masked_spec, mel_spec, mask
 
                 elif mode == 'video_only':
                     frames = h5f[f"{video_key}/frames"][:]
                     frames = self._process_video_frames(frames)
                     masked_spec = np.zeros_like(masked_spec)
-                    return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
+                    return frames, spk_emb, masked_spec, mel_spec, mask
             else:
                 frames = h5f[f"{video_key}/frames"][:]
                 frames = self._process_video_frames(frames)
 
-                return frames, torch.tensor(spk_emb), masked_spec, mel_spec, mask
+                return frames, spk_emb, masked_spec, mel_spec, mask
 
         raise NotImplementedError(f"Unsupported mode: {self.mode}")
 
-    def _process_video_frames(self, frames_np):
-        """
-        video frames shape: [T, H, W, C].
-        process video frames shape [T, C, H, W].
-        """
-        #valid = np.any(frames_np != 0, axis=(1, 2, 3))
-        #frames_np = frames_np[valid]
-
-        processed = []
-        for f in frames_np:
-            #img = Image.fromarray(f.astype(np.uint8))
-            img = Image.fromarray(f[..., 0])
-            processed.append(self.video_transform(img))
-
-        frames = torch.stack(processed)
-        #aug_frames = self.video_augment(frames)
-        return frames #aug_frames
+    # def _process_video_frames(self, frames_np):
+    #     """
+    #     video frames shape: [T, H, W, C].
+    #     process video frames shape [T, C, H, W].
+    #     """
+    #     #valid = np.any(frames_np != 0, axis=(1, 2, 3))
+    #     #frames_np = frames_np[valid]
+    #
+    #     processed = []
+    #     for f in frames_np:
+    #         #img = Image.fromarray(f.astype(np.uint8))
+    #         img = Image.fromarray(f[..., 0])
+    #         processed.append(self.video_transform(img))
+    #
+    #     frames = torch.stack(processed)
+    #     #aug_frames = self.video_augment(frames)
+    #     return frames #aug_frames
 
 if __name__ == "__main__":
 
     import math
-    from av_l_dataloader import AVDataloader
+    from av_l_dataloader_withdrop import AVDataloader
     # base_path = '/home/ai/Projects/Mahsa/datasets/vox2_short/'
     # path = base_path + 'vox2_short_test_features_chunk*.h5'
 
@@ -178,8 +180,8 @@ if __name__ == "__main__":
     #dataset = AVDataset(path, mode='v', mask_range='rand')
     #dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    dataset_name = 'voxceleb2'
-    av_loader = AVDataloader(dataset_name, 'v', 32, 8)
+    dataset_name = 'grid'
+    av_loader = AVDataloader(dataset_name, 'av', 4, 0)
     dataloader = av_loader.train_dataloader()
     print(len(dataloader))
 
@@ -188,23 +190,24 @@ if __name__ == "__main__":
     count = 0
 
     for frames, spk_emb, masked_spec, mel_spec, mask in dataloader:
+        print(frames.shape)
         #plt.imshow(frames[0,60,0,:,:])
         #plt.show()
         # mel_spec: [B, F, T] or [B, 1, F, T]
-        num_elements = mel_spec.numel()  # total elements in the batch
-
-        sum_val += mel_spec.sum().item()
-        sum_sqr_val += (mel_spec ** 2).sum().item()
-        count += num_elements
-
-    global_mean = sum_val / count
-    global_var = (sum_sqr_val / count) - (global_mean ** 2)
-    #global_var = max(global_var, 0.0)  # avoid small negatives
-    global_std = math.sqrt(global_var)
-
-    print(f"Mean: {global_mean}, std: {global_std}")
-
-    with open("voxceleb2_mel_stats.txt", "w") as f:
-        f.write(f"global mean of {dataset_name}: {global_mean}\n")
-        f.write(f"global std of {dataset_name}: {global_std}\n")
+    #     num_elements = mel_spec.numel()  # total elements in the batch
+    #
+    #     sum_val += mel_spec.sum().item()
+    #     sum_sqr_val += (mel_spec ** 2).sum().item()
+    #     count += num_elements
+    #
+    # global_mean = sum_val / count
+    # global_var = (sum_sqr_val / count) - (global_mean ** 2)
+    # #global_var = max(global_var, 0.0)  # avoid small negatives
+    # global_std = math.sqrt(global_var)
+    #
+    # print(f"Mean: {global_mean}, std: {global_std}")
+    #
+    # with open("voxceleb2_mel_stats.txt", "w") as f:
+    #     f.write(f"global mean of {dataset_name}: {global_mean}\n")
+    #     f.write(f"global std of {dataset_name}: {global_std}\n")
 
