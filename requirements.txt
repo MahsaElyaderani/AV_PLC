@@ -1,0 +1,1 @@
+pip install $(awk '/pip:/ {flag=1; next} /^ *[^- ]/ {flag=0} flag && /^ *- / {gsub(/^ *- /, ""); print}' torch_env.yml)
