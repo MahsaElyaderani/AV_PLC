@@ -88,60 +88,60 @@ class AVDataloader:
                           #collate_fn=self.av_collate_fn,
                           worker_init_fn=self.worker_init_fn)
 
-    def av_collate_fn(self, batch):
-        if self.mode == 'v' or self.mode == 'av':
-            frames, spk_embs, masked_specs, mel_specs, masks = zip(*batch)
-
-            processed_frames = []
-            for f in frames:  # each f: [T, C, H, W] or [75, 1, 112, 112]
-                f = f.permute(1, 0, 2, 3).unsqueeze(0)  # → [1, C, T, H, W]
-                _, C, T, H, W = f.shape
-                if T < 75:
-                    f = torch.nn.functional.interpolate(f, size=(75, H, W),
-                                                        mode='trilinear',
-                                                        align_corners=False)
-                f = f.squeeze(0).permute(1, 0, 2, 3)  # → [75, C, H, W]
-                processed_frames.append(f)
-
-            frames = torch.stack(processed_frames)  # [B, 75, C, H, W]
-            spk_embs = torch.stack([torch.as_tensor(s) for s in spk_embs])
-            masked_specs = torch.stack([torch.as_tensor(masked_spec) for masked_spec in masked_specs])
-            mel_specs = torch.stack([torch.as_tensor(mel_spec) for mel_spec in mel_specs])
-            masks = torch.stack([torch.as_tensor(mask) for mask in masks])
-            #masked_frames = self.apply_audio_mask_to_video(frames, masks)
-
-            return frames, spk_embs, masked_specs, mel_specs, masks
+    # def av_collate_fn(self, batch):
+    #     if self.mode == 'v' or self.mode == 'av':
+    #         frames, spk_embs, masked_specs, mel_specs, masks = zip(*batch)
+    #
+    #         processed_frames = []
+    #         for f in frames:  # each f: [T, C, H, W] or [75, 1, 112, 112]
+    #             f = f.permute(1, 0, 2, 3).unsqueeze(0)  # → [1, C, T, H, W]
+    #             _, C, T, H, W = f.shape
+    #             if T < 75:
+    #                 f = torch.nn.functional.interpolate(f, size=(75, H, W),
+    #                                                     mode='trilinear',
+    #                                                     align_corners=False)
+    #             f = f.squeeze(0).permute(1, 0, 2, 3)  # → [75, C, H, W]
+    #             processed_frames.append(f)
+    #
+    #         frames = torch.stack(processed_frames)  # [B, 75, C, H, W]
+    #         spk_embs = torch.stack([torch.as_tensor(s) for s in spk_embs])
+    #         masked_specs = torch.stack([torch.as_tensor(masked_spec) for masked_spec in masked_specs])
+    #         mel_specs = torch.stack([torch.as_tensor(mel_spec) for mel_spec in mel_specs])
+    #         masks = torch.stack([torch.as_tensor(mask) for mask in masks])
+    #         #masked_frames = self.apply_audio_mask_to_video(frames, masks)
+    #
+    #         return frames, spk_embs, masked_specs, mel_specs, masks
             #return masked_frames, spk_embs, masked_specs, mel_specs, masks
 
-    def apply_audio_mask_to_video(self, videos: torch.Tensor, audio_masks: torch.Tensor, threshold: float = 0.5):
-
-        masked_videos = []
-        for audio_mask, video in zip(audio_masks, videos):
-
-            T_v = video.shape[0]  # 75
-
-            # 1. Collapse mel bins to temporal dimension
-            time_mask = audio_mask.min(dim=0).values.float()  # [300], 1 = all OK, 0 = any lost
-
-            # 2. Reshape to [1, 1, 300] for pooling
-            time_mask = time_mask.view(1, 1, -1)  # [1, 1, 300]
-
-            # 3. Invert mask: 1 = lost, 0 = OK
-            inverted = 1.0 - time_mask
-
-            # 4. Detect any loss in group via max_pool1d
-            pooled = torch.nn.functional.max_pool1d(inverted, kernel_size=4, stride=4)  # [1, 1, 75]
-
-            # 5. Invert again: 1 = OK, 0 = loss
-            downsampled_mask = 1.0 - pooled.view(T_v)  # [75]
-
-            # 6. Expand to video frame shape
-            video_mask = downsampled_mask[:, None, None, None].expand(video.shape)  # [75, 1, 112, 112]
-
-            masked_video = video * video_mask
-            masked_videos.append(masked_video)
-
-        return torch.stack(masked_videos)
+    # def apply_audio_mask_to_video(self, videos: torch.Tensor, audio_masks: torch.Tensor, threshold: float = 0.5):
+    #
+    #     masked_videos = []
+    #     for audio_mask, video in zip(audio_masks, videos):
+    #
+    #         T_v = video.shape[0]  # 75
+    #
+    #         # 1. Collapse mel bins to temporal dimension
+    #         time_mask = audio_mask.min(dim=0).values.float()  # [300], 1 = all OK, 0 = any lost
+    #
+    #         # 2. Reshape to [1, 1, 300] for pooling
+    #         time_mask = time_mask.view(1, 1, -1)  # [1, 1, 300]
+    #
+    #         # 3. Invert mask: 1 = lost, 0 = OK
+    #         inverted = 1.0 - time_mask
+    #
+    #         # 4. Detect any loss in group via max_pool1d
+    #         pooled = torch.nn.functional.max_pool1d(inverted, kernel_size=4, stride=4)  # [1, 1, 75]
+    #
+    #         # 5. Invert again: 1 = OK, 0 = loss
+    #         downsampled_mask = 1.0 - pooled.view(T_v)  # [75]
+    #
+    #         # 6. Expand to video frame shape
+    #         video_mask = downsampled_mask[:, None, None, None].expand(video.shape)  # [75, 1, 112, 112]
+    #
+    #         masked_video = video * video_mask
+    #         masked_videos.append(masked_video)
+    #
+    #     return torch.stack(masked_videos)
 
     def __repr__(self) -> str:
         return (
