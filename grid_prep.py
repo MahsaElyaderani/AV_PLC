@@ -71,6 +71,6 @@ def split_dataset(root):
 
 
 if __name__ == "__main__":
-    root = '/Users/kadkhodm/PycharmProjects/speech_inpainting/datasets/grid'
+    root = '../datasets/grid'
     reduce_name(root)
     split_dataset(root)

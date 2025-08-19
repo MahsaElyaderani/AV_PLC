@@ -97,34 +97,8 @@ class CTCTokenizer:
                 indices = indices + [self.char2idx[self.blank_token]] * (max_length - len(indices))
         return indices
 
-    # def _decode_greedy(self, indices):
-    #
-    #     # if isinstance(indices, torch.Tensor):
-    #     #    batch_indices = batch_indices.cpu().numpy()
-    #     if indices.dim() == 2:
-    #         indices = torch.argmax(indices, dim=-1)  # [num_seq,]
-    #     indices = torch.unique_consecutive(indices, dim=-1)
-    #     indices = indices.cpu().tolist()
-    #     #indices = [i for i in indices if i != self.char2idx[self.blank_token]]
-    #     #joined = "".join([self.idx2char[i] for i in indices])
-    #     #final = joined.replace("|", " ").strip().split()
-    #     #return joined
-    #     decoded = []
-    #     for i in indices:
-    #         if i == self.char2idx[self.blank_token] or i == self.char2idx[self.unk_token]:
-    #             continue
-    #         elif i >= len(self.vocab):  # catch OOV errors
-    #             continue
-    #         decoded.append(self.idx2char[i])
-    #
-    #     return "".join(decoded)
-
     def _decode_greedy(self, input_seq):
-        """
-        input_seq: torch.Tensor or np.ndarray of shape (..., vocab_size) or (...,)
-        Returns:
-            str: Decoded string
-        """
+
         # Convert to numpy if tensor
         if isinstance(input_seq, torch.Tensor):
             if input_seq.dim() == 2:  # assume shape (T, vocab_size)

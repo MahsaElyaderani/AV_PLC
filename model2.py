@@ -8,32 +8,8 @@ from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from conformer import Conformer
 
 from resnet_ import ResNetModel
-from av_l_dataloader_withdrop import AVDataloader
+from av_dataloader import AVDataloader
 from trainer import Trainer, setup_logging
-
-
-class SpatialMaxPool3dMPS(nn.Module):
-    """Emulates MaxPool3d(k=(1,k,k)) via MaxPool2d on each frame (works on MPS)."""
-
-    def __init__(self, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)):
-        super().__init__()
-
-        # enforce triples
-        def _triple(x): return x if isinstance(x, tuple) else (x, x, x)
-
-        k = _triple(kernel_size);
-        s = _triple(stride);
-        p = _triple(padding)
-        assert k[0] == 1 and s[0] == 1 and p[0] == 0, "Temporal kernel must be 1 for this fallback."
-        self.pool2d = nn.MaxPool2d(kernel_size=(k[1], k[2]), stride=(s[1], s[2]), padding=(p[1], p[2]))
-
-    def forward(self, x):  # x: (N, C, T, H, W)
-        n, c, t, h, w = x.shape
-        x2d = x.permute(0, 2, 1, 3, 4).reshape(n * t, c, h, w)  # (N*T, C, H, W)
-        y2d = self.pool2d(x2d)
-        h2, w2 = y2d.shape[-2], y2d.shape[-1]
-        y = y2d.view(n, t, c, h2, w2).permute(0, 2, 1, 3, 4).contiguous()
-        return y
 
 
 class FusionModule(nn.Module):
@@ -73,16 +49,13 @@ class Video_Encoder(nn.Module):
     def __init__(self, conformer_block=6, hidden_size=512 // 2,
                  num_heads=4, spkr_vec=256, mel_dim=80, dropout=0.1):
         super(Video_Encoder, self).__init__()
-        pool = SpatialMaxPool3dMPS(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)) \
-            if device.type == 'mps' else \
-            nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
 
         self.frontend = nn.Sequential(
             nn.Conv3d(1, 64, kernel_size=(5, 7, 7),
                       stride=(1, 2, 2), padding=(2, 3, 3), bias=False),
             nn.BatchNorm3d(64),
             nn.ReLU(True),
-            pool
+            nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
         )
 
         self.resnet = ResNetModel(
@@ -109,6 +82,8 @@ class Video_Encoder(nn.Module):
                                   4 * mel_dim)  # mel bins are 80 and the output of mel_proj was 160 in the original code
 
     def forward(self, frame, spk_emb):
+
+        frame = frame.permute(0, 1, 4, 2, 3).contiguous()
         b, t_v, c, h, w = frame.shape
         x = frame.permute(0, 2, 1, 3, 4)  # [b, c=1, t_v, h, w]
 
@@ -176,7 +151,6 @@ class AV_ReVoice(nn.Module):
             # video_checkpoint_path = 'checkpoints/video_plc_sc(grid)/best_model.pt'
             # video_best_checkpoint = torch.load(video_checkpoint_path, map_location='cpu')
             # self.video_enc.load_state_dict(video_best_checkpoint['model_state_dict'])
-            self.video_enc = Video_Encoder()
 
             self.audio_dec = Audio_Decoder(mel_emb=1 * 80)
             # audio_checkpoint_path = 'checkpoints/audio_plc_pesq_0.01(grid)/best_model.pt'
@@ -231,11 +205,7 @@ if __name__ == "__main__":
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    device = (
-        torch.device('cuda') if torch.cuda.is_available()
-        else torch.device('mps') if torch.backends.mps.is_built() and torch.backends.mps.is_available()
-        else torch.device('cpu')
-    )
+    device = torch.device('cuda')
 
     for dataset_name in dataset_names:
         for l2s_flag in l2s_flags:
@@ -250,7 +220,7 @@ if __name__ == "__main__":
 
             logger.info("Initializing dataloaders...")
             av_dataloader = AVDataloader(mode='av', dataset_name=dataset_name,
-                                         batch_size=batch_size, num_workers=0)
+                                         batch_size=batch_size, num_workers=2)
             train_loader = av_dataloader.train_dataloader()
             val_loader = av_dataloader.val_dataloader()
 
@@ -259,6 +229,7 @@ if __name__ == "__main__":
             trainer = Trainer(
                 model=model,
                 mode='av',
+                drop_av=True,
                 l2s_loss=l2s_flag,
                 pesq_loss=pesq_flag,
                 model_name=model_name,

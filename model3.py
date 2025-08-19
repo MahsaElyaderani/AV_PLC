@@ -8,7 +8,7 @@ from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from conformer import Conformer
 
 from resnet_ import ResNetModel
-from av_l_dataloader import AVDataloader
+from av_dataloader import AVDataloader
 from trainer import Trainer, setup_logging
 
 

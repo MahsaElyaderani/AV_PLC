@@ -11,9 +11,6 @@ import multiprocessing
 from pathlib import Path
 import traceback
 import subprocess, shlex
-import re
-import random
-import sys
 
 import torch
 import torchaudio
@@ -22,17 +19,19 @@ from resemblyzer import VoiceEncoder
 import mediapipe
 from mediapipe.python.solutions.face_mesh_connections import FACEMESH_LIPS
 
-# Optional fairseq / AV-HuBERT
-try:
-    import fairseq
+# Install mediapipe; that is compatible OpenCV build
+#pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless opencv-contrib-python-headless
+#pip install mediapipe
 
+# fairseq / AV-HuBERT
+try:
+    from avhubert_featurizer import load_avhubert, extract_visual_feature
     HAS_FAIRSEQ = True
 except Exception:
     HAS_FAIRSEQ = False
 
 from text_processing import CTCTokenizer
 from masking import GilbertElliottModel
-# from avhubert_featurizer import load_avhubert, extract_visual_feature
 
 # -------------------- constants --------------------
 LANDMARK_DIM = 478
@@ -42,7 +41,6 @@ DURATION_SEC = 3.0
 T_TARGET = int(round(FPS * DURATION_SEC))
 AUDIO_LEN = int(round(SR * DURATION_SEC))
 lip_indices = sorted(set(i for connection in FACEMESH_LIPS for i in connection))
-
 
 # -------------------- init per-worker --------------------
 def init_worker():
@@ -88,18 +86,16 @@ def init_worker():
     global ctc_tokenizer
     ctc_tokenizer = CTCTokenizer()
 
-    # ---- AV-HuBERT load (optional) ----
-    # global avhubert_model, task
-    # avhubert_model, task = None, None
-    #
-    # try:
-    #     avhubert_model, task = load_avhubert()
-    #     logging.info(f"Loaded AV-HuBERT")
-    # except Exception as e:
-    #     logging.warning(f"AV-HuBERT not available: {e}")
-    # else:
-    #     logging.info("AV-HuBERT not configured; set AVHUBERT_CKPT.")
+    ######### ---- AV-HuBERT load ---- ########
+    global avhubert_model, task
+    avhubert_model, task = None, None
 
+    try:
+        avhubert_model, task = load_avhubert()
+    except Exception as e:
+        logging.warning(f"AV-HuBERT not available: {e}. Not configured? Set AVHUBERT_CKPT.")
+    else:
+        logging.info("Loaded AV-HuBERT")
 
 # -------------------- streaming helpers (OpenCV + FFmpeg) --------------------
 def read_audio_ffmpeg(path: str, target_sr: int = SR, max_sec: float = DURATION_SEC) -> torch.Tensor:
@@ -127,7 +123,7 @@ def read_audio_ffmpeg(path: str, target_sr: int = SR, max_sec: float = DURATION_
 def stream_decode_opencv(
         path: str,
         face_mesh,
-        frame_size=(96, 96),
+        frame_size=(112, 112),#(96, 96),
         target_fps: float = FPS,
         max_sec: float = DURATION_SEC,
         lip_indices=lip_indices
@@ -200,9 +196,8 @@ def stream_decode_opencv(
 
 # -------------------- masks & spec --------------------
 def extract_spectral(audio_1d: torch.Tensor) -> np.ndarray:
-    """Returns np.float16 spectrogram (n_mels, Tspec)"""
+
     spec = mel_transform(audio_1d)  # torch.float32
-    spec = spec.clamp_min(1e-5).to(torch.float32)
     return spec.cpu().numpy()
 
 
@@ -215,7 +210,6 @@ def generate_uniform_mask(size, loss_bounds=(0.3, 0.7)):
     model = GilbertElliottModel(loss_rate=np.random.uniform(*loss_bounds))
     return model.simulate(*size)
 
-
 # -------------------- main feature extraction --------------------
 def extract_features(video_path):
     results = []
@@ -223,7 +217,7 @@ def extract_features(video_path):
         # Stream decode (never load full clip)
         frames_roi, landmarks = stream_decode_opencv(
             video_path, face_mesh,
-            frame_size=(96, 96),
+            frame_size=(112, 112), #(96, 96),
             target_fps=FPS,
             max_sec=DURATION_SEC,
             lip_indices=lip_indices
@@ -243,20 +237,16 @@ def extract_features(video_path):
         # Speaker embedding (from this clip's audio; keep it simple here)
         spkr_embed = voice_encoder.embed_utterance(audio.detach().cpu().numpy().astype(np.float32))
 
-        # --- AV-HuBERT visual features (optional) ---
-        # avhubert_vis = None
-        # if avhubert_model is not None:
-        #     try:
-        #         with torch.no_grad():
-        #             avhubert_vis, _ = extract_visual_feature(avhubert_model,
-        #                                                      task,
-        #                                                      frames_roi[..., 0])
-        #             print(f"Video feature shape: {avhubert_vis}")
-        #             avhubert_vis = avhubert_vis.squeeze(dim=0)
-        #
-        #     except Exception as e:
-        #         logging.warning(f"AV-HuBERT features failed for {video_path}: {e}")
-        #         avhubert_vis = None
+        # --- AV-HuBERT visual features ---
+        avhubert_vis = None
+        if avhubert_model is not None:
+            try:
+                avhubert_vis = extract_visual_feature(avhubert_model,
+                                                             task,
+                                                             frames_roi[..., 0])
+            except Exception as e:
+                logging.warning(f"AV-HuBERT features failed for {video_path}: {e}")
+                avhubert_vis = None
 
         is_trainval = ('/train/' in video_path.lower()) or ('/val/' in video_path.lower())
 
@@ -268,8 +258,8 @@ def extract_features(video_path):
             'spec': spec,  # [80, Tspec] float32
             'spkr_embd': spkr_embed,  # [256] float32
         }
-        # if avhubert_vis is not None:
-        #     base['avhubert_vis'] = avhubert_vis  # [T', C] float32
+        if avhubert_vis is not None:
+            base['visual_features'] = avhubert_vis  # [T', C] float32
 
         if is_trainval:
             base['mask'] = generate_uniform_mask(spec.shape, loss_bounds=(0.3, 0.7))
@@ -383,15 +373,15 @@ def write_h5(output_file, results, start_index, mode):
             h5f.create_dataset(f"{video_key}/mask", data=result["mask"], compression="gzip")
             h5f.attrs[f"{video_key}/video_path"] = result["video_path"]
 
-            # Optional masks
+            #### masks
             for pct in (20, 30, 40, 50, 60, 70, 80):
                 key = f"mask_{pct}"
                 if key in result:
                     h5f.create_dataset(f"{video_key}/{key}", data=result[key], compression="gzip")
 
-            # AV-HuBERT features
-            # if 'avhubert_vis' in result and result['avhubert_vis'] is not None:
-            #     h5f.create_dataset(f"{video_key}/avhubert_vis", data=result['avhubert_vis'], compression="gzip")
+            ### AV-HuBERT features
+            if 'visual_features' in result and result['visual_features'] is not None:
+                h5f.create_dataset(f"{video_key}/visual_features", data=result['visual_features'], compression="gzip")
 
     logging.info(f"Wrote {len(results)} results to {output_file}")
 
@@ -419,11 +409,32 @@ def update_h5(chunk_file):
                 print(f"Warning: No video path found for {video_key}")
     print(f"Completed: {chunk_file}")
 
+def update_mel_h5(chunk_file):
+
+    print(f"Processing: {chunk_file}")
+    with h5py.File(chunk_file, 'r+') as h5f:
+        video_keys = list(h5f.keys())
+        for video_key in tqdm(video_keys, desc=f"{os.path.basename(chunk_file)}"):
+            video_path = h5f.attrs.get(f"{video_key}/video_path", None)
+            if video_path is not None:
+                audio = read_audio_ffmpeg(video_path, target_sr=SR, max_sec=DURATION_SEC)
+                if audio is None or audio.numel() == 0:
+                    print(f"Warning: No usable audio for {video_key}")
+                    continue
+                spec = extract_spectral(audio)
+                if f"{video_key}/spec" in h5f:
+                    del h5f[f"{video_key}/spec"]
+                h5f.create_dataset(f"{video_key}/spec", data=spec, compression="gzip")
+            else:
+                print(f"Warning: No video path found for {video_key}")
+    print(f"Completed: {chunk_file}")
+
 
 def update_h5_parallel(base_path, chunk_pattern="_chunk*.h5"):
     chunk_files = sorted(glob.glob(f"{base_path}{chunk_pattern}"))
     with multiprocessing.Pool(processes=min(16, len(chunk_files))) as pool:
-        pool.map(update_h5, chunk_files)
+        #pool.map(update_h5, chunk_files)
+        pool.map(update_mel_h5, chunk_files)
 
 
 # -------------------- entry --------------------
@@ -438,14 +449,14 @@ if __name__ == "__main__":
     torch.set_num_threads(1)
     multiprocessing.set_start_method("spawn", force=True)
 
-    splits = {"train"}  # add "val", "test" if desired
+    splits = {"val"}  # add "val", "train"
 
     for split in splits:
-        path = f'/Users/kadkhodm/PycharmProjects/speech_inpainting/datasets/grid/{split}/'
+        path = f'/home/nabizadz/Projects/Mahsa/datasets/grid/{split}/'
         video_list = glob.glob(os.path.join(path, 's*/*.mpg'))
 
-        feats_filename = f'datasets/grid_{split}_features.h5'
-        extract_features_parallel(video_list, feats_filename)
+        #feats_filename = f'datasets/grid_{split}_features.h5'
+        #extract_features_parallel(video_list, feats_filename)
 
-        # feats_path = f'/home/ai/Projects/Mahsa/datasets/vox2_short/vox2_short_{split}_features'
-        # update_h5_parallel(feats_path)
+        feats_path = f'datasets/grid/grid_{split}_features'
+        update_h5_parallel(feats_path)

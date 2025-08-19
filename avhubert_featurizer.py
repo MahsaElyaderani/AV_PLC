@@ -8,7 +8,7 @@ from fairseq import checkpoint_utils, options, tasks, utils
 import importlib
 import sys
 
-sys.path.append("/Users/kadkhodm/PycharmProjects/speech_inpainting/sources/av_hubert/avhubert")
+sys.path.append("/home/nabizadz/Projects/Mahsa/sources/av_hubert/avhubert")
 
 import hubert_asr, hubert_pretraining, hubert
 
@@ -105,38 +105,23 @@ class RandomCrop(object):
         return self.__class__.__name__ + '(size={0})'.format(self.size)
 
 
-import contextlib
-
-user_dir = "/Users/kadkhodm/PycharmProjects/speech_inpainting/sources/av_hubert/avhubert"
-ckpt_path = "/Users/kadkhodm/PycharmProjects/speech_inpainting/sources/av_hubert/finetune-model.pt"
-
-
-# PyTorch 2.6+ safe loading compatibility
-@contextlib.contextmanager
-def _unsafe_torch_load():
-    """Temporarily disable weights_only for trusted checkpoints."""
-    orig_load = torch.load
-    torch.load = lambda *args, **kwargs: orig_load(*args, **{**kwargs, 'weights_only': False})
-    try:
-        yield
-    finally:
-        torch.load = orig_load
+user_dir = "/home/nabizadz/Projects/Mahsa/sources/av_hubert/avhubert"
+ckpt_path = "/home/nabizadz/Projects/Mahsa/sources/av_hubert/finetune-model.pt"
 
 
 def load_avhubert(ckpt_path=ckpt_path, user_dir=user_dir, is_finetune_ckpt=False):
     # utils.import_user_module(Namespace(user_dir=user_dir))
-    with _unsafe_torch_load():
-        models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([ckpt_path])
-        model = models[0]
-        if hasattr(models[0], 'decoder'):
-            print(f"Checkpoint: fine-tuned")
-            model = models[0].encoder.w2v_model
-        else:
-            print(f"Checkpoint: pre-trained w/o fine-tuning")
-        # model.cuda()
-        model.eval()
-        model.to("mps")
-        return model, task
+    models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([ckpt_path])
+    model = models[0]
+    if hasattr(models[0], 'decoder'):
+        print(f"Checkpoint: fine-tuned")
+        model = models[0].encoder.w2v_model
+    else:
+        print(f"Checkpoint: pre-trained w/o fine-tuning")
+
+    model.eval()
+    model.to("cuda")
+    return model, task
 
 
 def extract_visual_feature(model, task, frames):
@@ -146,13 +131,11 @@ def extract_visual_feature(model, task, frames):
                          Normalize(task.cfg.image_mean, task.cfg.image_std)])
 
     frames = transform(frames)
-    print(f"Center crop video to: {frames.shape}")
-    frames = torch.FloatTensor(frames).unsqueeze(dim=0).unsqueeze(dim=0)
+    frames = torch.FloatTensor(frames).unsqueeze(dim=0).unsqueeze(dim=0).to('cuda')
 
     with torch.no_grad():
         feature, _ = model.extract_finetune(source={'video': frames, 'audio': None},
                                             padding_mask=None,
                                             output_layer=None)
         feature = feature.squeeze(dim=0)
-    print(f"Video feature shape: {feature.shape}")
-    return feature
+    return feature.detach().cpu().numpy()

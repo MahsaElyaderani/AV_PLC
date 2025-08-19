@@ -13,7 +13,7 @@ from editdistance import eval as edit_eval
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from hifigan.hifigan.generator import HifiganGenerator
 from audio_processing import torch_mel2audio
-from audio_processing import inv_spectrogram, inv_melspectrogram
+#from audio_processing import inv_spectrogram, inv_melspectrogram
 
 
 class Vocoder:
@@ -73,15 +73,6 @@ def calculate_psnr(original, reconstructed, max_val=None):
         max_val = np.max(np.abs(original))
 
     return 20 * np.log10(max_val / np.sqrt(mse))
-
-
-def spec_to_audio(spectrogram):
-    return inv_melspectrogram(spectrogram)
-
-
-def mel_to_audio(spectrogram, phase):
-    return inv_spectrogram(spectrogram, phase)
-
 
 def torch_mel_to_audio(spectrogram, phase):
     return torch_mel2audio(spectrogram)
