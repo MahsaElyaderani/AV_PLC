@@ -6,7 +6,7 @@ from torch.nn.utils import remove_weight_norm, weight_norm
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from typing import Tuple
 
-from stable_diffusion.dataset.hifigan.hifigan.utils import get_padding
+from .utils import get_padding
 
 LRELU_SLOPE = 0.1
 
@@ -14,16 +14,16 @@ LRELU_SLOPE = 0.1
 class HifiganGenerator(torch.nn.Module):
     def __init__(
         self,
-        in_channels: int = 128,
+        in_channels: int = 80, #128,
         resblock_dilation_sizes: Tuple[Tuple[int, ...], ...] = (
             (1, 3, 5),
             (1, 3, 5),
             (1, 3, 5),
         ),
         resblock_kernel_sizes: Tuple[int, ...] = (3, 7, 11),
-        upsample_kernel_sizes: Tuple[int, ...] = (32, 16, 8),#(16, 16, 8, 4), #(20, 8, 4, 4), #
+        upsample_kernel_sizes: Tuple[int, ...] = (20, 8, 4, 4),
         upsample_initial_channel: int = 512,
-        upsample_factors: int = (16, 8, 4), #(8, 8, 4, 2),#(10, 4, 2, 2), #
+        upsample_factors: int = (10, 4, 2, 2),
         inference_padding: int = 5,
         sample_rate: int = 16000,
     ):
