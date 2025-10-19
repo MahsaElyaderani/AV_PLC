@@ -92,7 +92,15 @@ python main.py --datasets grid --batch-size 8 --epochs 100
 python main.py --datasets grid --batch-size 8 --epochs 100 --pesq true --asr true --plc-loss-rates 20 40 60
 ```
 
----
+| Argument    | Type | Default | Description                                                        |
+| ----------- | ---- | ------- | ------------------------------------------------------------------ |
+| `--pesq`    | bool | `true`  | Enable PESQ perceptual loss                                        |
+| `--stoi`    | bool | `false` | Enable STOI intelligibility loss                                   |
+| `--asr`     | bool | `true`  | Enable ASR perceptual loss                                         |
+| `--sc-flag` | bool | `false` | Enable spectral-consistency loss                                   |
+| `--l2s`     | bool | `true`  | Enable lip-to-speech (AV fusion) mode; if `false`, uses audio-only |
+
+### Other training options
 
 ## 4. Checkpoints and Logging
 
@@ -120,8 +128,9 @@ python main.py --datasets grid --plc-loss-rates 20 30 40 50 60
 
 Results and evaluation metrics (e.g., PESQ/STOI) are logged under the corresponding log directory.
 
-<!-- ---
-## Citation
+---
+
+<!--## Citation
 
 If you use this repository, please cite:
 
