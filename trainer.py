@@ -125,7 +125,7 @@ class Trainer:
         self.w_synth = 0.1
         self.w_rec = 0.05
 
-        # init components/opt/sched
+        # init components
         self._initialize_components(weight_decay, betas, cosine_Tmax)
 
         # trackers
@@ -240,7 +240,6 @@ class Trainer:
             if isinstance(out, (tuple, list)):
                 if len(out) == 3:
                     return out[0], out[1], out[2]
-            # single fused head
             return out, None, None
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
@@ -325,8 +324,7 @@ class Trainer:
 
         for bidx, batch in enumerate(iterator):
 
-            if torch.cuda.memory_allocated() > 8e9:  # 8GB threshold
-                #self.asr_criterion.clear_cache()
+            if torch.cuda.memory_allocated() > 8e9:
                 torch.cuda.empty_cache()
 
             visual_feats, spk_emb, masked_spec, spec, audio_length, mask, path = self._move_batch_to_device(batch)
@@ -579,30 +577,6 @@ class Trainer:
 
             self._plot_spectrogram_row(ax_spec_row, masked_np, fused_np, rec_np, spec_np, synth_np, i, fig)
             self._plot_waveform_row(ax_wave_row, masked_audio, fused_audio, rec_audio, orig_audio, synth_audio, i)
-            #
-            # def _to_float_m1p1(x):
-            #     x = np.asarray(x)
-            #     if x.dtype.kind in "iu":
-            #         x = x.astype(np.float32) / np.iinfo(x.dtype).max
-            #     return np.clip(x.astype(np.float32), -1.0, 1.0)
-            #
-            # # Normalize audio before saving
-            # original_audio_f32 = _to_float_m1p1(orig_audio)
-            # masked_audio_f32 = _to_float_m1p1(masked_audio)
-            # reconstructed_audio_f32 = _to_float_m1p1(fused_audio)
-            #
-            # spec_dir = os.path.join(plot_dir, 'spectrograms')
-            # os.makedirs(spec_dir, exist_ok=True)
-            # spec_path = os.path.join(spec_dir, f'conformer_{epoch}_{timestamp}.npz')
-            # np.savez_compressed(
-            #     spec_path,
-            #     masked_spec=masked_np.astype("float32"),
-            #     recon_spec=fused_np.astype("float32"),
-            #     original_spec=spec_np.astype("float32"),
-            #     masked_audio=masked_audio_f32,
-            #     recon_audio=reconstructed_audio_f32,
-            #     original_audio=original_audio_f32,
-            # )
 
         #plt.suptitle(f'Spectrogram and Waveform Comparison - Epoch {epoch}')
         plt.tight_layout()
@@ -621,7 +595,7 @@ class Trainer:
                                    origin='lower', interpolation='none')
             #set the subfig size to be (4.5, 3.5)
             #axes[col].set_title(f'Input')# - #{sample_idx+1}')
-            #fig.colorbar(im1, ax=axes[col], format='%+2.0f')
+
             #mse = float(np.mean((orig_spec - masked_spec) ** 2))
             #axes[col].set_ylabel(f'MSE Masked: {mse:.4f}')
             col += 1
@@ -629,7 +603,7 @@ class Trainer:
         if fused_spec is not None:
             im11 = axes[col].imshow(fused_spec, aspect='auto', origin='lower', interpolation='none')
             #axes[col].set_title(f'Fused')# - #{sample_idx+1}')
-            #fig.colorbar(im11, ax=axes[col], format='%+2.0f')
+
             #mse = float(np.mean((orig_spec - fused_spec) ** 2))
             #axes[col].set_ylabel(f'MSE FUSE: {mse:.2f}')
             col += 1
@@ -637,7 +611,7 @@ class Trainer:
         if rec_spec is not None:
             im2 = axes[col].imshow(rec_spec, aspect='auto', origin='lower', interpolation='none')
             #axes[col].set_title(f'Reconstructed')# - #{sample_idx+1}')
-            #fig.colorbar(im2, ax=axes[col], format='%+2.0f')
+
             #mse = float(np.mean((orig_spec - rec_spec) ** 2))
             #axes[col].set_ylabel(f'MSE REC: {mse:.2f}')
             col += 1
@@ -645,18 +619,14 @@ class Trainer:
         if synth_spec is not None:
             im3 = axes[col].imshow(synth_spec, aspect='auto', origin='lower', interpolation='none')
             #axes[col].set_title(f'Synthesized')# - #{sample_idx+1}')
-            #fig.colorbar(im3, ax=axes[col], format='%+2.0f')
+
             #mse = float(np.mean((orig_spec - synth_spec) ** 2))
             #axes[col].set_ylabel(f'MSE SYNTH: {mse:.2f}')
             col += 1
 
         im4 = axes[col].imshow(orig_spec, aspect='auto', origin='lower', interpolation='none')
         #axes[col].set_title(f'Original')# - #{sample_idx+1}')
-        #fig.colorbar(im4, ax=axes[col], format='%+2.0f')
 
-        # --- Set consistent axis ranges across all spectrograms ---
-        # Assume all spectrograms have the same shape (n_mels × n_frames)
-        # --- Ensure consistent axis ranges and visible ticks for all spectrograms ---
         height, width = orig_spec.shape
 
         for ax in axes:
@@ -674,12 +644,10 @@ class Trainer:
             # Keep proper aspect ratio
             ax.set_aspect('auto')
 
-        # --- Colorbar without shrinking or overlapping the last column ---
-        # fig.canvas.draw()  # ensure axes positions are up-to-date
-        #
+        # --- Colorbar ---
+        # fig.canvas.draw()
         # last_ax = axes[col]
-        # bbox = last_ax.get_position()  # in figure coordinates
-        #
+        # bbox = last_ax.get_position()
         # pad = 0.1  # gap between last axis and colorbar
         # cbar_w = 0.003  # width of the colorbar axis
         #
@@ -937,13 +905,13 @@ class Trainer:
 
                 if len(fused_accum) > 0:
                     fused_cat = torch.cat(fused_accum, dim=0)
-                    # metrics = calculate_batch_metrics(
-                    #     original_batch=specs_cat, reconstructed_batch=fused_cat,
-                    #     all_text=None, all_pred_text=None,
-                    #     mask=None, path=all_paths,
-                    #     hifigan_vocoder=self.vocoder, tokenizer=None,
-                    #     max_samples=len(specs_cat), sample_rate=self.sample_rate)
-                    # fused_metrics.append(metrics)
+                    metrics = calculate_batch_metrics(
+                        original_batch=specs_cat, reconstructed_batch=fused_cat,
+                        all_text=None, all_pred_text=None,
+                        mask=None, path=all_paths,
+                        hifigan_vocoder=self.vocoder, tokenizer=None,
+                        max_samples=len(specs_cat), sample_rate=self.sample_rate)
+                    fused_metrics.append(metrics)
                     self._save_sample_audio(specs_cat[:keep],
                                             fused_cat[:keep],
                                             audio_dir, sample_id,
@@ -951,41 +919,41 @@ class Trainer:
 
 
                 if len(recs_accum) > 0:
-                     recs_cat = torch.cat(recs_accum, dim=0)
-                #     metrics = calculate_batch_metrics(
-                #         original_batch=specs_cat, reconstructed_batch=recs_cat,
-                #         all_text=None, all_pred_text=None,
-                #         mask=None, path=all_paths,
-                #         hifigan_vocoder=self.vocoder, tokenizer=None,
-                #         max_samples=len(specs_cat), sample_rate=self.sample_rate)
-                #     rec_metrics.append(metrics)
-                     self._save_sample_audio(specs_cat[:keep],
+                    recs_cat = torch.cat(recs_accum, dim=0)
+                    metrics = calculate_batch_metrics(
+                        original_batch=specs_cat, reconstructed_batch=recs_cat,
+                        all_text=None, all_pred_text=None,
+                        mask=None, path=all_paths,
+                        hifigan_vocoder=self.vocoder, tokenizer=None,
+                        max_samples=len(specs_cat), sample_rate=self.sample_rate)
+                    rec_metrics.append(metrics)
+                    self._save_sample_audio(specs_cat[:keep],
                                              recs_cat[:keep],
                                              audio_dir, sample_id,
                                              timestamp, output="recs")
 
                 if len(synth_accum) > 0:
-                     synth_cat = torch.cat(synth_accum, dim=0)
-                #     metrics = calculate_batch_metrics(original_batch=specs_cat, reconstructed_batch=synth_cat,
-                #         all_text=None, all_pred_text=None,
-                #         mask=None, path=all_paths,
-                #         hifigan_vocoder=self.vocoder, tokenizer=None,
-                #         max_samples=len(specs_cat), sample_rate=self.sample_rate)
-                #     synth_metrics.append(metrics)
-                     self._save_sample_audio(specs_cat[:keep],
+                    synth_cat = torch.cat(synth_accum, dim=0)
+                    metrics = calculate_batch_metrics(original_batch=specs_cat, reconstructed_batch=synth_cat,
+                        all_text=None, all_pred_text=None,
+                        mask=None, path=all_paths,
+                        hifigan_vocoder=self.vocoder, tokenizer=None,
+                        max_samples=len(specs_cat), sample_rate=self.sample_rate)
+                    synth_metrics.append(metrics)
+                    self._save_sample_audio(specs_cat[:keep],
                                              synth_cat[:keep],
                                              audio_dir, sample_id,
                                              timestamp, output="synth")
 
                 if len(maskd_accum) > 0:
                     maskd_cat = torch.cat(maskd_accum, dim=0)
-                    # all_masks_cat = torch.cat(all_masks, dim=0)
-                #     in_metrics = calculate_batch_metrics(original_batch=specs_cat, reconstructed_batch=maskd_cat,
-                #     all_text = None, all_pred_text = None,
-                #     mask=all_masks_cat, path=all_paths,
-                #     hifigan_vocoder = self.vocoder, tokenizer = None,
-                #     max_samples = len(specs_cat), sample_rate = self.sample_rate)
-                #     input_metrics.append(in_metrics)
+                    all_masks_cat = torch.cat(all_masks, dim=0)
+                    in_metrics = calculate_batch_metrics(original_batch=specs_cat, reconstructed_batch=maskd_cat,
+                    all_text = None, all_pred_text = None,
+                    mask=all_masks_cat, path=all_paths,
+                    hifigan_vocoder = self.vocoder, tokenizer = None,
+                    max_samples = len(specs_cat), sample_rate = self.sample_rate)
+                    input_metrics.append(in_metrics)
                     self._save_sample_audio(specs_cat[:keep],
                                             maskd_cat[:keep],
                                             audio_dir, sample_id,
@@ -1160,8 +1128,6 @@ class Trainer:
                     sample_id += 1
 
     def evaluate_samples(self, test_loader, loss_rate):
-
-        total_loss = 0.0
 
         eval_dir = os.path.join(self.run_dir, f'test_{loss_rate}')
         os.makedirs(eval_dir, exist_ok=True)
@@ -1385,10 +1351,6 @@ class Trainer:
                         hifigan_vocoder=self.vocoder, tokenizer=None,
                         max_samples=len(specs_cat), sample_rate=self.sample_rate)
                     rec_metrics.append(metrics)
-                #      self._save_sample_audio(specs_cat[:keep],
-                #                              recs_cat[:keep],
-                #                              audio_dir, sample_id,
-                #                              timestamp, output="recs")
 
                 sample_id += keep
 
@@ -1452,11 +1414,6 @@ class Trainer:
             if val_metrics is not None:
                 val_loss = val_metrics['loss']
 
-                # sparse TB
-                # if (epoch + 1) % 2 == 0:
-                #     for k, v in val_metrics.items():
-                #         self.writer.add_scalar(f'Validation/{k}', float(v), self.global_step)
-
                 if (epoch + 1) % 10 == 0 or epoch == start_epoch:
                     self._log_results(epoch + 1, samples_to_log)
 
@@ -1469,15 +1426,6 @@ class Trainer:
                 self._save_checkpoint(epoch, is_best=False)
 
             elapsed = time.time() - epoch_start
-            #if val_metrics:
-            #    val_str = ", ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()])
-            #else:
-            #    val_str = ""
-            # self.logger.info(
-            #     f"Epoch {epoch+1}/{num_epochs} in {elapsed:.2f}s - "
-            #     f"Train Loss: {train_loss:.4f}, LR: {current_lr:.9f}"
-            #     + (f", Val: {val_str}" if val_str else "")
-            # )
 
             postfix = f"Train Loss: {train_loss:.4f}"
             if val_metrics:
@@ -1485,11 +1433,6 @@ class Trainer:
             postfix += f", LR: {current_lr:.9f}"
             postfix += f", elapsed time: {elapsed:.4f}"
             epoch_iter.set_postfix_str(postfix)
-
-            # sparse TB
-            # if (epoch + 1) % 2 == 0:
-            #     self.writer.add_scalar('Train/epoch_loss', train_loss, epoch+1)
-            #     self.writer.add_scalar('Train/epoch_lr', current_lr, epoch+1)
 
         total_time = time.time() - total_start
         self.logger.info(f"Training completed in {total_time/3600:.2f} h")
