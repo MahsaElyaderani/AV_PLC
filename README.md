@@ -120,9 +120,8 @@ python main.py --datasets grid --plc-loss-rates 20 30 40 50 60
 
 Results and evaluation metrics (e.g., PESQ/STOI) are logged under the corresponding log directory.
 
----
-
-<!--## Citation
+<!-- ---
+## Citation
 
 If you use this repository, please cite:
 
