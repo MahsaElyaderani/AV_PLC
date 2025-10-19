@@ -134,10 +134,5 @@ If you use this repository, please cite:
   note         = {GitHub repository},
   howpublished = {\url{https://github.com/<your_username>/<repo_name>}}
 }-->
-```
-
-```
-
----
 
 
