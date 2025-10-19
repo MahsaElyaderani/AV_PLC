@@ -102,6 +102,7 @@ def set_seeds(seed: int = 1337, deterministic: bool = True):
 
 if __name__ == "__main__":
 
+    set_seeds(1337)
     batch_size = 32
     num_epochs = 100
     learning_rate = 1e-4
@@ -117,12 +118,7 @@ if __name__ == "__main__":
     checkpoint_dir = 'checkpoints'
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    set_seeds(1337)
-
-    results = []
 
     for dataset_name in dataset_names:
         model_name = (f"{'av' if l2s_flag else 'audio'}"
@@ -184,10 +180,4 @@ if __name__ == "__main__":
         for plc_loss_rate in plc_loss_rates:
             test_loader = av_dataloader.test_dataloader(plc_loss_rate)
             test_loss = trainer.evaluate(test_loader, plc_loss_rate)
-            #logger.info(f"[{fusion_name}] PLC={plc_loss_rate} test: {test_loss:.4f}")
-            #trainer.evaluate_samples(test_loader, plc_loss_rate)
-            #trainer.save_plots(test_loader, plc_loss_rate)
-            #trainer.evaluate_plots(test_loader, plc_loss_rate)
-            #trainer.evaluate_synth(test_loader, plc_loss_rate)
-            #trainer.evaluate_rec(test_loader, loss_rate=plc_loss_rate)
 

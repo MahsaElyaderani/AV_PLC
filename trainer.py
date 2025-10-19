@@ -19,7 +19,6 @@ import torchaudio
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-#from torch_stoi import NegSTOILoss
 from matplotlib.ticker import FormatStrFormatter
 
 from torch.utils.tensorboard import SummaryWriter
@@ -61,8 +60,7 @@ class Trainer:
     Modes:
       'a'  : audio-only PLC (masked_spec -> rec_spec)
       'v'  : video-only synthesis (visual_feats, spk_emb -> rec_spec)
-      'av' : audio-visual (masked_spec, visual_feats, spk_emb -> rec_spec[, synth_spec])
-      'motion': treated like 'a' for criterion choice
+      'av' : audio-visual (masked_spec, visual_feats, spk_emb -> fused_spc, rec_spec, synth_spec)
     """
     def __init__(
         self,
@@ -171,7 +169,7 @@ class Trainer:
         else:
             self.asr_criterion = None
 
-        # optional vocoder
+        # vocoder
         self.vocoder = Vocoder(self.vocoder_path) if self.vocoder_path is not None else None
 
         # optimizer + scheduler
@@ -284,9 +282,6 @@ class Trainer:
             with torch.amp.autocast('cuda',enabled=False):
                 pow_ref = torch_mel2spec(spec.float()).permute(0, 2, 1).contiguous()
                 pow_est = torch_mel2spec(fused_spec.float()).permute(0, 2, 1).contiguous()
-
-                #pow_ref = ref.pow(2).float()
-                #pow_est = est.pow(2).float()
                 pmsqe_loss = torch.mean(self.pmsqe(pow_est, pow_ref))
 
             parts['pmsqe_loss'] = pmsqe_loss
@@ -400,7 +395,7 @@ class Trainer:
         batch_losses = []
         acc_parts = defaultdict(list)
 
-        target_metric_samples = 12  # e.g., 8–16 total
+        target_metric_samples = 16
         specs_accum, fused_accum = [], []
         recs_accum, synth_accum = [], []
         mask_accum, path_accum = [], []

@@ -1,13 +1,8 @@
-import os
 import torch
-import random
-import numpy as np
 import torch.nn as nn
 
 from conformer import Conformer
 from resnet_ import ResNetModel
-from av_dataloader import AVDataloader
-from trainer import Trainer, setup_logging
 
 
 class Video_Encoder(nn.Module):
@@ -100,77 +95,3 @@ class Video_Encoder(nn.Module):
         mel = mel.permute(0, 2, 1)  # [B,mel,T]
 
         return mel, v_feat
-
-
-
-if __name__ == "__main__":
-
-
-    batch_size = 8
-    num_epochs = 200
-    learning_rate = 0.0001
-
-    pesq_flag = False
-    l2s_flags = [False]
-    dataset_names = ['grid'] #['grid', 'voxceleb2']
-    plc_loss_rates = ['20', '30', '40', '50', '60', 'rand']
-
-
-    log_dir = 'logs'
-    checkpoint_dir = 'checkpoints'
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    for dataset_name in dataset_names:
-        for l2s_flag in l2s_flags:
-                model_name = f"video_v2_reg_aug{'_sc' if l2s_flag else ''}{'_pesq' if pesq_flag else ''}({dataset_name})"
-                logger = setup_logging(model_name, log_dir)
-                logger.info(f"Using device: {device}")
-
-                conformer_blocks = 6 if dataset_name == 'grid' else 8
-                attn_heads = 4 if dataset_name == 'grid' else 8
-                model = Video_Encoder(conformer_block=conformer_blocks, num_heads=attn_heads)
-
-                logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
-                #model = torch.compile(model)
-
-                logger.info("Initializing dataloaders...")
-                av_dataloader = AVDataloader(mode='v', dataset_name=dataset_name,
-                                            batch_size=batch_size, num_workers=2)
-
-                train_loader = av_dataloader.train_dataloader()
-                val_loader = av_dataloader.val_dataloader()
-
-                #vocoder_path = '/home/ai/Projects/Mahsa/sources/stable_diffusion/dataset/hifigan/checkpoints/seg_len_4096/model-best.pt'
-                trainer = Trainer(
-                    model=model,
-                    mode='v',
-                    drop_av=False,
-                    sc_loss=False,
-                    pesq_loss=pesq_flag,
-                    stoi_loss=False,
-                    asr_loss=False,
-                    model_name=model_name,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    learning_rate=learning_rate,
-                    device=device,
-                    vocoder_path=None,
-                    checkpoint_dir=checkpoint_dir,
-                    log_dir=log_dir,
-                    mixed_precision=True,
-                    use_bf16=True,
-                    cosine_Tmax=50
-                )
-
-                logger.info(f"Starting training for {num_epochs} epochs...")
-                start_epoch = trainer.load_checkpoint(load_best=False)
-                trainer.train(num_epochs=num_epochs, start_epoch=start_epoch)
-
-                for plc_loss_rate in plc_loss_rates:
-                    test_loader = av_dataloader.test_dataloader(plc_loss_rate)
-                    logger.info("Evaluating model on test set...")
-                    test_loss = trainer.evaluate(test_loader, plc_loss_rate)
-                    logger.info(f"Final test loss: {test_loss:.4f}")

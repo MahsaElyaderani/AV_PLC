@@ -1,6 +1,6 @@
 # Audio-Visual Packet Loss Concealment (AV-PLC)
 
-This repository provides an end-to-end framework for **audio-visual speech inpainting** — reconstructing missing or degraded speech segments using both **audio** and **visual (lip-motion)** cues.  
+This repository provides an end-to-end framework for **audio-visual speech inpainting** — reconstructing missing or degraded speech segments using both **audio** and **visual ** cues.  
 It supports feature extraction, multimodal model training, and evaluation across multiple datasets (e.g., **GRID**, **LRS2**, **VoxCeleb2**).
 
 ---
@@ -28,8 +28,6 @@ The main entry point is `main.py`, which handles:
 ├── trainer.py               # Training, validation, evaluation logic
 ├── av_dataloader.py         # Audio-visual dataset loader and batching
 ├── datasets/                # Dataset root directory (Grid, LRS2, VoxCeleb2, etc.)
-├── checkpoints/             # Saved model weights
-└── logs/                    # Training and evaluation logs
 
 ````
 
@@ -37,17 +35,11 @@ The main entry point is `main.py`, which handles:
 
 ## 1. Installation
 
-Create the environment from the YAML file (if provided):
+Create the environment from the YAML file:
 ```bash
 conda env create -f speech_environment.yml
 conda activate speech_environment
 ````
-
-Otherwise, manually install dependencies:
-
-```bash
-pip install torch torchvision torchaudio h5py numpy tqdm librosa
-```
 
 ---
 
@@ -71,7 +63,7 @@ This will:
 Train the **Audio-Visual PLC** model with default settings:
 
 ```bash
-python main.py --datasets grid --batch-size 32 --epochs 100
+python main.py --datasets grid --batch-size 8 --epochs 100
 ```
 
 ### Optional arguments (loss toggles)
@@ -87,8 +79,8 @@ python main.py --datasets grid --batch-size 32 --epochs 100
 ### Other training options
 
 | Argument            | Default | Description                    |
-| ------------------- | ------- | ------------------------------ |
-| `--batch-size`      | 32      | Mini-batch size                |
+| ------------------- |---------| ------------------------------ |
+| `--batch-size`      | 8       | Mini-batch size                |
 | `--epochs`          | 100     | Number of epochs               |
 | `--learning-rate`   | 1e-4    | Learning rate for optimizer    |
 | `--mixed-precision` | true    | Use automatic mixed precision  |
@@ -97,7 +89,7 @@ python main.py --datasets grid --batch-size 32 --epochs 100
 **Example:**
 
 ```bash
-python main.py --datasets grid --batch-size 8 --epochs 200 --pesq true --asr true --plc-loss-rates 20 40 60
+python main.py --datasets grid --batch-size 8 --epochs 100 --pesq true --asr true --plc-loss-rates 20 40 60
 ```
 
 ---
@@ -127,30 +119,6 @@ python main.py --datasets grid --plc-loss-rates 20 30 40 50 60
 ```
 
 Results and evaluation metrics (e.g., PESQ/STOI) are logged under the corresponding log directory.
-
----
-
-## Example Workflow
-
-```bash
-# Step 1: Extract features
-python main.py --save_features --dataset grid
-
-# Step 2: Train the model
-python main.py --datasets grid --epochs 200 --pesq true --asr true
-
-# Step 3: Evaluate on specific PLC rates
-python main.py --datasets grid --plc-loss-rates 20 40 60
-```
-
----
-
-## Model Summary
-
-* **Encoders:** Separate conformer-based audio and video encoders
-* **Decoder:** Cross-modal attention for reconstructing missing speech frames
-* **Losses:** Combination of reconstruction, PESQ/STOI perceptual, and ASR-guided losses
-* **Datasets supported:** GRID, LRS2, VoxCeleb2
 
 ---
 

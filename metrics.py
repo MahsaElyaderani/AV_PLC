@@ -13,7 +13,7 @@ from speechmos import plcmos
 from editdistance import eval as edit_eval
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 
-from AV_PLC.hifigan.hifigan.generator import HifiganGenerator
+from hifigan.hifigan.generator import HifiganGenerator
 from audio_processing import torch_mel2audio,librosa_mel2audio, load_audio_ffmpeg
 import re, unicodedata
 import whisper
