@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, List
 
-from stable_diffusion.dataset.hifigan.hifigan.utils import get_padding
+from .utils import get_padding
 
 
 LRELU_SLOPE = 0.1

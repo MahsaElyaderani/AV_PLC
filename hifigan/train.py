@@ -1,8 +1,7 @@
 import argparse
-import glob
 import logging
 from pathlib import Path
-from tqdm import tqdm, trange
+
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -20,18 +19,17 @@ from hifigan.discriminator import (
     discriminator_loss,
     generator_loss,
 )
-from hifigan.dataset import MelDataset#, LogMelSpectrogram
-from stable_diffusion.dataset.utils import melspectrogram
+from hifigan.dataset import MelDataset, LogMelSpectrogram
 from hifigan.utils import load_checkpoint, save_checkpoint, plot_spectrogram
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
-BATCH_SIZE = 32
-SEGMENT_LENGTH = 4096 #8704
-HOP_LENGTH = 515
+BATCH_SIZE = 16
+SEGMENT_LENGTH = 8320
+HOP_LENGTH = 160
 SAMPLE_RATE = 16000
 BASE_LEARNING_RATE = 2e-4
 FINETUNE_LEARNING_RATE = 1e-4
@@ -39,8 +37,8 @@ BETAS = (0.8, 0.99)
 LEARNING_RATE_DECAY = 0.999
 WEIGHT_DECAY = 1e-5
 EPOCHS = 3100
-LOG_INTERVAL = 10000
-VALIDATION_INTERVAL = 10000
+LOG_INTERVAL = 5
+VALIDATION_INTERVAL = 5000
 NUM_GENERATED_EXAMPLES = 10
 CHECKPOINT_INTERVAL = 10000
 
@@ -57,8 +55,8 @@ def train_model(rank, world_size, args):
     log_dir.mkdir(exist_ok=True, parents=True)
 
     if rank == 0:
-        #logger.setLevel(logging.DEBUG)
-        handler = logging.FileHandler(log_dir / "hifigan.log")
+        logger.setLevel(logging.DEBUG)
+        handler = logging.FileHandler(log_dir / f"{args.checkpoint_dir.stem}.log")
         handler.setLevel(logging.DEBUG)
         formatter = logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s", datefmt="%m/%d/%Y %I:%M:%S"
@@ -131,7 +129,7 @@ def train_model(rank, world_size, args):
         pin_memory=True,
     )
 
-    #melspectrogram = LogMelSpectrogram().to(rank)
+    melspectrogram = LogMelSpectrogram().to(rank)
 
     if args.resume is not None:
         global_step, best_loss = load_checkpoint(
@@ -162,34 +160,21 @@ def train_model(rank, world_size, args):
     logger.info(f"started at epoch: {start_epoch}")
     logger.info("**" * 40 + "\n")
 
-    epoch_iterator = trange(start_epoch, n_epochs, desc="Training", unit="epoch")
-    for epoch in epoch_iterator:
+    for epoch in range(start_epoch, n_epochs + 1):
         train_sampler.set_epoch(epoch)
 
         generator.train()
         discriminator.train()
         average_loss_mel = average_loss_discriminator = average_loss_generator = 0
-
-        train_iterator = tqdm(train_loader,
-                            desc=f"Epoch {epoch}/{n_epochs} [Train]",
-                            leave=False, unit="batch")
-
-        for i, (wavs, mels, tgts) in enumerate(train_iterator, 1):
+        for i, (wavs, mels, tgts) in enumerate(train_loader, 1):
             wavs, mels, tgts = wavs.to(rank), mels.to(rank), tgts.to(rank)
-            #print("wavs shape: ", wavs.shape)
-            #print("mels shape: ", mels.shape)
+
             # Discriminator
             optimizer_discriminator.zero_grad()
 
-            # wavs_ = generator(mels.squeeze(1))
-            # mels_ = melspectrogram(wavs_)
+            wavs_ = generator(mels.squeeze(1))
+            mels_ = melspectrogram(wavs_)
 
-            wavs_ = generator(mels)
-
-            mels_ = melspectrogram(wavs_.squeeze(1).cpu().detach().numpy())
-            mels_ = torch.from_numpy(mels_).to(rank)
-            mels_ = torch.transpose(mels_, 1, 0)
-            #print("mels_ shape: ", mels_.shape)
             scores, _ = discriminator(wavs)
             scores_, _ = discriminator(wavs_.detach())
 
@@ -241,30 +226,15 @@ def train_model(rank, world_size, args):
                     )
 
             if global_step % VALIDATION_INTERVAL == 0:
-                logger.info(
-                    f"train -- epoch: {epoch}, "
-                    f"step: {global_step}, "
-                    f"mel loss: {average_loss_mel:.4f}, "
-                    f"generator loss: {average_loss_generator:.4f}, "
-                    f"discriminator loss: {average_loss_discriminator:.4f}"
-                )
                 generator.eval()
 
                 average_validation_loss = 0
-                val_iterator = tqdm(validation_loader,
-                                    desc=f"Epoch {epoch}/{n_epochs} [Valid]",
-                                    leave=False, unit="batch")
-                for j, (wavs, mels, tgts) in enumerate(val_iterator, 1):
+                for j, (wavs, mels, tgts) in enumerate(validation_loader, 1):
                     wavs, mels, tgts = wavs.to(rank), mels.to(rank), tgts.to(rank)
 
                     with torch.no_grad():
-                        # wavs_ = generator(mels.squeeze(1))
-                        # mels_ = melspectrogram(wavs_)
-
-                        wavs_ = generator(mels)
-                        mels_ = melspectrogram(wavs_.squeeze(1).cpu().detach().numpy())
-                        mels_ = torch.from_numpy(mels_).to(rank)
-                        mels_ = torch.transpose(mels_, 1, 0)
+                        wavs_ = generator(mels.squeeze(1))
+                        mels_ = melspectrogram(wavs_)
 
                         length = min(mels_.size(-1), tgts.size(-1))
 
@@ -336,7 +306,7 @@ if __name__ == "__main__":
     #dataset_dir = '/home/ai/Projects/Mahsa/datasets/VCTK-Corpus-0.92-16000-23777s8000/'
 
     dataset_dir = '/home/ai/Projects/Mahsa/datasets/vox2_short/vox2_dev_mp4'
-    checkpoint_dir = '/home/ai/Projects/Mahsa/sources/stable_diffusion/dataset/hifigan/checkpoints/seg_len_4096'
+    checkpoint_dir = '/home/ai/Projects/Mahsa/sources/AV_PLC/hifigan/checkpoints'
 
     parser = argparse.ArgumentParser(description="Train or finetune HiFi-GAN.")
     parser.add_argument(
@@ -357,7 +327,7 @@ if __name__ == "__main__":
         "--resume",
         help="path to the checkpoint to resume from",
         type=Path,
-        default='/home/ai/Projects/Mahsa/sources/stable_diffusion/dataset/hifigan/checkpoints/seg_len_4096/model-best.pt'
+        default='/home/ai/Projects/Mahsa/sources/AV_PLC/hifigan/checkpoints/model-4400000.pt'
     )
     parser.add_argument(
         "--finetune",
@@ -386,3 +356,4 @@ if __name__ == "__main__":
         nprocs=world_size,
         join=True,
     )
+

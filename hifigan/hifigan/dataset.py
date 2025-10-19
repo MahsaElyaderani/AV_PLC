@@ -1,39 +1,41 @@
-import glob
-import os
 from pathlib import Path
 import math
 import random
+import glob
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision.io import read_video
-from torch.utils.data import Dataset
 
 import torchaudio
-import torchaudio.transforms as transforms
-from stable_diffusion.dataset.utils import melspectrogram
+from torch.utils.data import Dataset
+from torchvision.io import read_video
 
-# class LogMelSpectrogram(torch.nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.melspctrogram = transforms.MelSpectrogram(
-#             sample_rate=16000,
-#             n_fft=1024,
-#             win_length=1024,
-#             hop_length=160,
-#             center=False,
-#             power=1.0,
-#             norm="slaney",
-#             onesided=True,
-#             n_mels=128,
-#             mel_scale="slaney",
-#         )
-#
-#     def forward(self, wav):
-#         wav = F.pad(wav, ((1024 - 160) // 2, (1024 - 160) // 2), "reflect")
-#         mel = self.melspctrogram(wav)
-#         logmel = torch.log(torch.clamp(mel, min=1e-5))
-#         return logmel
+
+class LogMelSpectrogram(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.melspctrogram = torchaudio.transforms.MelSpectrogram(
+        sample_rate=16000,
+        n_fft=512,
+        win_length=400,
+        hop_length=160,
+        center=False,
+        power=1.0,
+        norm="slaney",
+        onesided=True,
+        n_mels=80,
+        mel_scale="slaney",
+    )
+
+        self.amp2db_transform = torchaudio.transforms.AmplitudeToDB(stype='magnitude', top_db=80)
+    def forward(self, wav):
+        padding = (512 - 160) // 2
+        wav = torch.nn.functional.pad(wav, (padding, padding), "reflect")
+        mel = self.melspctrogram(wav)
+        mel = mel.clamp(min=1e-5)  # avoid log(0)
+        logmel = self.amp2db_transform(mel)
+        return logmel
 
 
 class MelDataset(Dataset):
@@ -56,9 +58,13 @@ class MelDataset(Dataset):
         self.train = train
         self.finetune = finetune
 
-        # suffix = ".wav" if not finetune else ".npy"
-        # pattern = f"train/*{suffix}" if train else f"validation/*{suffix}"
-        # self.metadata = glob.glob(os.path.join(self.data_dir, pattern))
+        #suffix = ".wav" if not finetune else ".npy"
+        #pattern = f"train/**/*{suffix}" if train else f"dev/**/*{suffix}"
+
+        #self.metadata = [
+        #    path.relative_to(self.data_dir).with_suffix("")
+        #    for path in self.data_dir.rglob(pattern)
+        #]
 
         suffix = ".mp4" if not finetune else ".npy"
         pattern = f"*/*/*{suffix}"
@@ -72,7 +78,7 @@ class MelDataset(Dataset):
         else:
             self.metadata = video_list[split_point:]
 
-        #self.logmel = LogMelSpectrogram()
+        self.logmel = LogMelSpectrogram()
 
     def __len__(self):
         return len(self.metadata)
@@ -82,10 +88,16 @@ class MelDataset(Dataset):
         #wav_path = self.wavs_dir / path
         wav_path = self.metadata[index]
 
-        #info = torchaudio.info(wav_path.with_suffix(".wav"))
-        #info = torchaudio.info(wav_path)
+        # info = torchaudio.info(wav_path.with_suffix(".wav"))
+        # if info.sample_rate != self.sample_rate:
+        #     raise ValueError(
+        #         f"Sample rate {info.sample_rate} doesn't match target of {self.sample_rate}"
+        #     )
         _, _wav, _meta = read_video(wav_path)
-        sr = _meta['audio_fps'] #sr = info.sample_rate
+        if _wav.dim() == 2 and _wav.size(0) > 1:  # [C, T]
+            _wav = _wav.mean(dim=0, keepdim=True)  # [1, T]
+
+        sr = _meta['audio_fps']  # sr = info.sample_rate
         if sr != self.sample_rate:
             raise ValueError(
                 f"Sample rate {sr} doesn't match target of {self.sample_rate}"
@@ -107,28 +119,20 @@ class MelDataset(Dataset):
             frame_offset = random.randint(0, max(frame_diff, 0))
 
         # wav, _ = torchaudio.load(
-        #     #filepath=wav_path.with_suffix(".wav"),
-        #     wav_path,
+        #     filepath=wav_path.with_suffix(".wav"),
         #     frame_offset=frame_offset if self.train else 0,
         #     num_frames=self.segment_length if self.train else -1,
         # )
-        # if wav.size(-1) < self.segment_length:
-        #     wav = F.pad(wav, (0, self.segment_length - wav.size(-1)))
-
-        if self.train:
-            wav = _wav[:, frame_offset : frame_offset + self.segment_length]
-            if wav.size(-1) < self.segment_length:
-                wav = F.pad(wav, (0, self.segment_length - wav.size(-1)))
-        else:
-            wav = _wav
+        wav = _wav[:, frame_offset : frame_offset + self.segment_length] if self.train else _wav
+        if wav.size(-1) < self.segment_length:
+            wav = F.pad(wav, (0, self.segment_length - wav.size(-1)))
 
         if not self.finetune and self.train:
             gain = random.random() * (0.99 - 0.4) + 0.4
             flip = -1 if random.random() > 0.5 else 1
             wav = flip * gain * wav / max(wav.abs().max(), 1e-5)
 
-        #tgt_logmel = self.logmel(wav.unsqueeze(0)).squeeze(0)
-        tgt_logmel = melspectrogram(wav).squeeze(1)
+        tgt_logmel = self.logmel(wav.unsqueeze(0)).squeeze(0)
 
         if self.finetune:
             if self.train:
@@ -144,7 +148,37 @@ class MelDataset(Dataset):
                     src_logmel.min(),
                 )
         else:
-            #src_logmel = tgt_logmel.clone()
-            src_logmel = tgt_logmel.copy()
-        #print(torch.FloatTensor(src_logmel).dtype)
-        return wav, torch.FloatTensor(src_logmel), torch.FloatTensor(tgt_logmel)
+            src_logmel = tgt_logmel.clone()
+
+        return wav, src_logmel, tgt_logmel
+
+if __name__ == "__main__":
+    from torch.utils.data import DataLoader
+    from matplotlib import pyplot as plt
+
+    dataset = MelDataset(
+        root=Path("/home/ai/Projects/Mahsa/datasets/vox2_short/vox2_dev_mp4"),
+        segment_length=8192,
+        sample_rate=16000,
+        hop_length=160,
+        train=True,
+    )
+    print(f"Number of training utterances: {len(dataset)}")
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=16,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    for i, batch in enumerate(dataloader):
+        wavs, src_mels, tgt_mels = batch
+        #print(wavs.shape, src_mels.shape, tgt_mels.shape)
+        #plt.imshow(tgt_mels[0][0].numpy(), aspect='auto', origin='lower')
+        #plt.show()
+        print(src_mels.min(), src_mels.max())
+        if i == 10:
+            break

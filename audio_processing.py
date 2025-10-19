@@ -1,175 +1,199 @@
 import numpy as np
 import librosa
 import librosa.filters
+import os
 from scipy import signal
 import soundfile as sf
-import random
-from itertools import groupby
-from scipy.signal import butter, sosfilt, sosfreqz
+import torch
+import torchaudio
+import subprocess, shlex
+
 # Character vocabulary
 # Griffin-Lim implementation by candlewill
 # Audio -> Spectrogram / Spectrogram -> Audio conversion
 # https://github.com/candlewill/Griffin_lim
 
-num_mels = 80 #128
-num_freq = 640 #257 #Number of frequency bins in the linear spectrogram. n_stft = n_fft // 2 + 1 for real-valued signals
+mel_mean = -56.775
+mel_std = 19.707
+hop_len = 160
+win_len = 400
+n_fft = 512
+n_stft = n_fft // 2 + 1
+num_mels = 80
 sample_rate = 16000
-frame_length_ms = 40 #24
-frame_shift_ms = 10 #12
-preemphasis = 0.97
+frame_length_ms = 25
+frame_shift_ms = 10
 min_level_db = -80
-ref_level_db = 20
 griffin_lim_iters = 60
 
-def load_wav(path, sr):
-    return librosa.load(path, sr=sr)[0]
+def load_audio_ffmpeg(path, sr=sample_rate, fixlen_sec=None):
+    """
+    Decode 'path' (mp4/mpg/wav/...) to mono float32 at 'sr' using FFmpeg.
+    If fixlen_sec is provided, trim/pad to exactly sr*fixlen_sec samples.
+    """
+    cmd = [
+        "ffmpeg", "-v", "error", "-nostdin",
+        "-i", str(path),
+        "-vn",           # no video
+        "-ac", "1",      # mono
+        "-ar", str(sr),  # resample
+        # optional: pick first audio stream explicitly
+        # "-map", "0:a:0",
+    ]
+    if fixlen_sec is not None:
+        cmd += ["-t", str(float(fixlen_sec))]
+    cmd += ["-f", "f32le", "pipe:1"]  # raw float32 PCM to stdout
 
-def save_wav(wav, path):
-    sf.write(path, wav, sample_rate, subtype='PCM_16')
+    out = subprocess.run(cmd, stdout=subprocess.PIPE, check=True).stdout
+    a = np.frombuffer(out, dtype=np.float32).copy()  # 1-D mono float32
+    peak = np.max(np.abs(a)) or 1.0
+    if peak > 1.0:
+        a = a / peak  # peak-normalize
 
-def spectrogram(y):
-    D = _stft(_preemphasis(y))
-    S = _amp_to_db(np.abs(D)) - ref_level_db
-    #phase = np.angle(D)
-    #return _normalize(S), phase
-    return _normalize(S)
+    if fixlen_sec is not None:
+        N = int(round(sr * float(fixlen_sec)))
+        if a.size < N:
+            a = np.pad(a, (0, N - a.size), mode="constant")
+        elif a.size > N:
+            a = a[:N]
+    return a
 
-def inv_spectrogram(spectrogram, angles):
-    S = _db_to_amp(_denormalize(spectrogram) + ref_level_db)
-    if angles is None:
-        return _inv_preemphasis(_griffin_lim(S ** 1.5))
-    else:
-        S_complex = S * np.exp(1j * angles)
-        return _inv_preemphasis(_istft(S_complex))
+def read_gt_input(video_path, mask, base_path="/home/ai/Projects/Mahsa/datasets",
+                  sample_rate=sample_rate, fixlen_sec=3):
+    rel_path = video_path.split("datasets", 1)[-1].lstrip(os.sep)
+    audio_path = os.path.join(base_path, rel_path)
+    original_audio_np = load_audio_ffmpeg(audio_path, sr=sample_rate, fixlen_sec=fixlen_sec)
+    if mask is not None:
+        if isinstance(mask, torch.Tensor):
+            mask = mask.cpu().numpy()
+        mask_t = mask[0].astype(np.float32)  # (T,)
+        sample_mask = np.repeat(mask_t, hop_len)  # e.g., hop_length=160 for 16 kHz, 10 ms hop
+        sample_mask = sample_mask[:len(original_audio_np)]
+        masked_audio_np = original_audio_np * sample_mask
 
-def melspectrogram(y):
-    D = _stft(_preemphasis(y))
-    S = _amp_to_db(_linear_to_mel(np.abs(D)))
-    return _normalize(S)
+    return original_audio_np, masked_audio_np if mask is not None else None
 
-def inv_melspectrogram(melspectrogram):
-    S = _mel_to_linear(_db_to_amp(_denormalize(melspectrogram)))  # Convert back to linear
-    return _inv_preemphasis(_griffin_lim(S ** 1.5))  # Reconstruct phase
-
-# Based on https://github.com/librosa/librosa/issues/434
-def _griffin_lim(S):
-
-    S_complex = np.abs(S).astype(np.complex_)
-
-    angles = np.exp(2j * np.pi * np.random.rand(*S.shape))
-    for i in range(griffin_lim_iters):
-        if i > 0:
-            angles = np.exp(1j * np.angle(_stft(y)))
-        y = _istft(S_complex * angles)
-
-    return y
-
-def _stft(y):
-    n_fft = (num_freq - 1) * 2 #num_freq = n_stft
-    hop_length = int(frame_shift_ms / 1000. * sample_rate)
-    win_length = int(frame_length_ms / 1000. * sample_rate)
-    return librosa.stft(y=y, n_fft=n_fft, hop_length=hop_length, win_length=win_length)
-
-def _istft(y):
-    hop_length = int(frame_shift_ms / 1000. * sample_rate)
-    win_length = int(frame_length_ms / 1000. * sample_rate)
-    return librosa.istft(y, hop_length=hop_length, win_length=win_length)
-
-# Conversions:
-_mel_basis = None
-_inv_mel_basis = None
-
-def _linear_to_mel(spectrogram):
-    global _mel_basis
-    if _mel_basis is None:
-        _mel_basis = _build_mel_basis()
-    return np.dot(_mel_basis, spectrogram)
-
-def _mel_to_linear(mel_spectrogram):
-    global _inv_mel_basis
-    if _inv_mel_basis is None:
-        _inv_mel_basis = np.linalg.pinv(_build_mel_basis())
-    return np.maximum(1e-10, np.dot(_inv_mel_basis, mel_spectrogram))
-
-def _build_mel_basis():
-    n_fft = (num_freq - 1) * 2
-    return librosa.filters.mel(sr=sample_rate, n_fft=n_fft, n_mels=num_mels)
-
-def _amp_to_db(x):
-    return 20 * np.log10(np.maximum(1e-5, x))
-
-def _db_to_amp(x):
-    return np.power(10.0, x * 0.05)
-
-def _preemphasis(x):
-    return signal.lfilter([1, -preemphasis], [1], x)
-
-def _inv_preemphasis(x):
-    return signal.lfilter([1], [1, -preemphasis], x)
-
-def _normalize(S):
-    return np.clip((S - min_level_db) / -float(min_level_db), 0, 1)
-
-
-def _denormalize(S):
-    return (np.clip(S, 0, 1) * -min_level_db) + min_level_db
-
-
-import torch
-import torchaudio
-
-def torch_denormalize(S):
-    return (torch.clip(S, 0, 1) * -min_level_db) + min_level_db
-
-def torch_db_to_amp(x):
-    return torch.pow(10.0, x * 0.05)
-
-def pow_spec(x):
-    return torch_db_to_amp(torch_denormalize(x) + ref_level_db) ** 2
 
 def torch_audio2mel(audio):
 
     melspctrogram = torchaudio.transforms.MelSpectrogram(
-        sample_rate=16000,
-        n_fft=640,
-        win_length=640,
-        hop_length=160,
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        win_length=win_len,
+        hop_length=hop_len,
         center=False,
-        power=1.0,
+        power=1.0, # 1 for magnitude, 2 for power, etc
         norm="slaney",
         onesided=True,
-        n_mels=80,
+        n_mels=num_mels,
         mel_scale="slaney",
     )
-    padding = (640 - 160) // 2
+    amp2db_transform = torchaudio.transforms.AmplitudeToDB(stype='magnitude', top_db=80)
+
+    padding = (n_fft - hop_len) // 2
     wav = torch.nn.functional.pad(audio, (padding, padding), "reflect")
-    mel = melspctrogram(wav)
-    logmel = torch.log(torch.clamp(mel, min=1e-5))
+    mel_mag = melspctrogram(wav)
+    mel_mag = mel_mag.clamp(min=1e-5)  # avoid log(0)
+    logmel = amp2db_transform(mel_mag)
+    logmel_norm = (logmel - mel_mean)/mel_std
 
-    return logmel
+    return logmel_norm
 
-def torch_mel2audio(logmel):
+def torch_mel2spec(mel_norm):
 
+    # 1. Denormalize
+    mel_db = (mel_norm * mel_std) + mel_mean
+
+    # 2. Convert dB to power
+    mel_mag = torchaudio.functional.DB_to_amplitude(mel_db, ref=1.0, power=0.5)
+    mel_mag = mel_mag.clamp(min=1e-5)
+
+    # 3. Mel -> Linear
     inv_mel = torchaudio.transforms.InverseMelScale(
-        n_stft=320+1,
-        n_mels=80,
-        sample_rate=16000,
+        n_stft=n_stft,
+        n_mels=num_mels,
+        sample_rate=sample_rate,
         f_min=0.0,
         f_max=8000.0,
         norm='slaney',
-        mel_scale='slaney'
-    )
+        mel_scale='slaney',
+    ).to(mel_norm.device)
 
+    linear_spec = inv_mel(mel_mag).clamp(min=1e-5)
+
+    return linear_spec ** 2
+
+
+def torch_mel2audio(mel_norm):
+
+    # 1. Denormalize
+    mel_db = (mel_norm * mel_std) + mel_mean
+
+    # 2. Convert dB to power
+    mel_mag = torchaudio.functional.DB_to_amplitude(mel_db, ref=1.0, power=0.5)
+    mel_mag = mel_mag.clamp(min=1e-5)
+
+    # 3. Mel -> Linear
+    inv_mel = torchaudio.transforms.InverseMelScale(
+        n_stft=n_stft,
+        n_mels=num_mels,
+        sample_rate=sample_rate,
+        f_min=0.0,
+        f_max=8000.0,
+        norm='slaney',
+        mel_scale='slaney',
+    ).to(mel_norm.device)
+    linear_spec = inv_mel(mel_mag).clamp(min=1e-5)
+
+    # 4. Reconstruct waveform (Griffin-Lim)
     griffin_lim = torchaudio.transforms.GriffinLim(
-        n_fft=640,
-        win_length=640,
-        hop_length=160,
+        n_fft=n_fft,
+        win_length=win_len,
+        hop_length=hop_len,
         power=1.0,
-        n_iter=32
+        n_iter=griffin_lim_iters
     )
-
-    mel = torch.exp(logmel)
-    linear_spec = inv_mel(mel)
     audio = griffin_lim(linear_spec)
 
+    # Normalize to [-1, 1] range
+    audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
     return audio
+
+def librosa_mel2audio(mel_norm, sr=16000, n_fft=512, win_length=400, hop=160,
+                      fmin=0.0, fmax=8000.0, mel_mean=-56.775, mel_std=19.707, n_iter=64):
+    # 1) denorm dB -> magnitude  (matches torchaudio AmplitudeToDB with stype='magnitude')
+    mel_db  = mel_norm * mel_std + mel_mean
+    #mel_db = mel_db.clamp(min=-80.0, max=0.0)  # match top_db=80
+
+    mel_mag = librosa.db_to_amplitude(np.asarray(mel_db.cpu(),
+                                                 dtype=np.float32), ref=1.0)  # shape [M, T]
+
+    # 2) mel (magnitude) -> linear (magnitude)
+    S_mag = librosa.feature.inverse.mel_to_stft(
+        mel_mag,
+        sr=sr,
+        n_fft=n_fft,
+        power=1.0,
+        fmin=fmin,
+        fmax=fmax,
+        norm='slaney',
+        htk=False
+    )
+    # 3) Griffin-Lim with center=False (to mirror your forward path)
+    y = librosa.griffinlim(
+        S_mag,
+        n_iter=n_iter,
+        hop_length=hop,
+        win_length=win_length,
+        window='hann',
+        center=False,
+        momentum=0.99,
+        pad_mode='constant'
+    )
+    pad = (n_fft - hop) // 2
+    y = y[pad:-pad]  # remove the artificial reflect region
+    #peak = np.max(np.abs(y)) or 1.0
+    #if peak > 1.0:
+    #    y = y / peak  # peak-normalize
+    y = y / (np.max(np.abs(y)) + 1e-8)
+    return torch.from_numpy(y)
