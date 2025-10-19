@@ -1,4 +1,3 @@
-```markdown
 # Audio-Visual Packet Loss Concealment (AV-PLC)
 
 This repository provides an end-to-end framework for **audio-visual speech inpainting** — reconstructing missing or degraded speech segments using both **audio** and **visual (lip-motion)** cues.  
