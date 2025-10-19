@@ -105,16 +105,14 @@ if __name__ == "__main__":
     batch_size = 32
     num_epochs = 100
     learning_rate = 1e-4
-    pesq_flag = True
-    stoi_flag = False
-    asr_flag = True
-    pretrained_enc = False
-    sc_flags = [False]
-    l2s_flag = True
-    dataset_names = ['grid'] #['grid', 'lrs2', 'voxceleb2']
-    plc_loss_rates = ['60'] #'20', '30', '40', '50',
-    fusion_names = ["concat_mlp"]#,"gated_sum", "concat_time", "film", "cross_attn"]
+    stoi_flag, sc_flag = False, False
+    pesq_flag, asr_flag, l2s_flag = True, True, True
+
+    fusion_name = "concat_mlp"
+    dataset_names = ['grid', 'lrs2', 'voxceleb2']
+    plc_loss_rates = ['20', '30', '40', '50', '60']
     vocoder_path = '/home/ai/Projects/Mahsa/sources/AV_PLC/hifigan/checkpoints/model-best.pt'
+
     log_dir = 'logs'
     checkpoint_dir = 'checkpoints'
     os.makedirs(log_dir, exist_ok=True)
@@ -127,72 +125,69 @@ if __name__ == "__main__":
     results = []
 
     for dataset_name in dataset_names:
-        for sc_flag in sc_flags:
-            for fusion_name in fusion_names:
-                model_name = (f"{'av' if l2s_flag else 'audio'}"
-                              f"_plc_a0.05_v0.1{'_'+fusion_name if l2s_flag else ''}"
-                              f"{'_pretraind' if pretrained_enc else ''}"
-                              f"{'_sc' if sc_flag else ''}"
-                              f"{'_pesq_0.01' if pesq_flag else ''}"
-                              f"{'_stoi_0.01' if stoi_flag else ''}"
-                              f"{'_asr_0.1' if asr_flag else ''}"
-                              f"({dataset_name})")
-                logger = setup_logging(model_name, log_dir)
-                logger.info(f"Using device: {device}; Fusion: {fusion_name}")
+        model_name = (f"{'av' if l2s_flag else 'audio'}"
+                      f"_plc_a0.05_v0.1{'_'+ fusion_name if l2s_flag else ''}"
+                      f"{'_sc' if sc_flag else ''}"
+                      f"{'_pesq_0.01' if pesq_flag else ''}"
+                      f"{'_stoi_0.01' if stoi_flag else ''}"
+                      f"{'_asr_0.1' if asr_flag else ''}"
+                      f"({dataset_name})")
+        logger = setup_logging(model_name, log_dir)
+        logger.info(f"Using device: {device}; Fusion: {fusion_name}")
 
-                video_depth = 6 if dataset_name == 'grid' else 6
-                video_heads = 4 if dataset_name == 'grid' else 4
+        video_depth = 6 if dataset_name == 'grid' else 6
+        video_heads = 4 if dataset_name == 'grid' else 4
 
-                audio_depth = 4 if dataset_name == 'grid' else 4
-                audio_heads = 4 if dataset_name == 'grid' else 4
+        audio_depth = 4 if dataset_name == 'grid' else 4
+        audio_heads = 4 if dataset_name == 'grid' else 4
 
-                video_hidden_size = 256 if dataset_name == 'grid' else 256
-                audio_hidden_size = 256
-                feat_dim = 256 #if dataset_name == 'grid' else 512
+        video_hidden_size = 256 if dataset_name == 'grid' else 256
+        audio_hidden_size = 256
+        feat_dim = 256 #if dataset_name == 'grid' else 512
 
-                model = AV_PLC(video_depth=video_depth, video_heads=video_heads,
-                               audio_depth=audio_depth, audio_heads=audio_heads,
-                               video_hidden_size=video_hidden_size,
-                               audio_hidden_size=audio_hidden_size, feat_dim=feat_dim).to(device)
-                logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
+        model = AV_PLC(video_depth=video_depth, video_heads=video_heads,
+                       audio_depth=audio_depth, audio_heads=audio_heads,
+                       video_hidden_size=video_hidden_size,
+                       audio_hidden_size=audio_hidden_size, feat_dim=feat_dim).to(device)
+        logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
 
-                av_dataloader = AVDataloader(mode='av' if l2s_flag else 'a',
-                                             dataset_name=dataset_name,
-                                             batch_size=batch_size, num_workers=4,
-                                             dropout_modality=l2s_flag, video_aug=True,)
-                train_loader = av_dataloader.train_dataloader()
-                val_loader = av_dataloader.val_dataloader()
+        av_dataloader = AVDataloader(mode='av' if l2s_flag else 'a',
+                                     dataset_name=dataset_name,
+                                     batch_size=batch_size, num_workers=4,
+                                     dropout_modality=l2s_flag, video_aug=True,)
+        train_loader = av_dataloader.train_dataloader()
+        val_loader = av_dataloader.val_dataloader()
 
-                trainer = Trainer(
-                    model=model,
-                    mode='av' if l2s_flag else 'a',
-                    drop_av=l2s_flag,
-                    sc_loss=sc_flag,
-                    pesq_loss=pesq_flag,
-                    stoi_loss=stoi_flag,
-                    asr_loss=asr_flag,
-                    model_name=model_name,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    learning_rate=learning_rate,
-                    vocoder_path=vocoder_path,
-                    checkpoint_dir=checkpoint_dir,
-                    log_dir=log_dir,
-                    mixed_precision=True,
-                    use_bf16=True,
-                    cosine_Tmax=num_epochs
-                )
+        trainer = Trainer(
+            model=model,
+            mode='av' if l2s_flag else 'a',
+            drop_av=l2s_flag,
+            sc_loss=sc_flag,
+            pesq_loss=pesq_flag,
+            stoi_loss=stoi_flag,
+            asr_loss=asr_flag,
+            model_name=model_name,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            learning_rate=learning_rate,
+            vocoder_path=vocoder_path,
+            checkpoint_dir=checkpoint_dir,
+            log_dir=log_dir,
+            mixed_precision=True,
+            use_bf16=True,
+            cosine_Tmax=num_epochs
+        )
 
-                #start_epoch = trainer.load_checkpoint(load_best=True)
-                #trainer.train(num_epochs=num_epochs, start_epoch=start_epoch)
+        start_epoch = trainer.load_checkpoint(load_best=True)
+        trainer.train(num_epochs=num_epochs, start_epoch=start_epoch)
 
-                for plc_loss_rate in plc_loss_rates:
-                    test_loader = av_dataloader.test_dataloader(plc_loss_rate)
-                    #test_loss = trainer.evaluate(test_loader, plc_loss_rate)
-                    #logger.info(f"[{fusion_name}] PLC={plc_loss_rate} test: {test_loss:.4f}")
-                    #trainer.evaluate_samples(test_loader, plc_loss_rate)
-                    #trainer.save_plots(test_loader, plc_loss_rate)
-                    trainer.evaluate_plots(test_loader, plc_loss_rate)
-                    #trainer.evaluate_synth(test_loader, plc_loss_rate)
-                    #trainer.evaluate_rec(test_loader, loss_rate=plc_loss_rate)
+        for plc_loss_rate in plc_loss_rates:
+            test_loader = av_dataloader.test_dataloader(plc_loss_rate)
+            test_loss = trainer.evaluate(test_loader, plc_loss_rate)
+            #logger.info(f"[{fusion_name}] PLC={plc_loss_rate} test: {test_loss:.4f}")
+            #trainer.evaluate_samples(test_loader, plc_loss_rate)
+            #trainer.save_plots(test_loader, plc_loss_rate)
+            #trainer.evaluate_plots(test_loader, plc_loss_rate)
+            #trainer.evaluate_synth(test_loader, plc_loss_rate)
+            #trainer.evaluate_rec(test_loader, loss_rate=plc_loss_rate)
 

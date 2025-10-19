@@ -23,6 +23,7 @@ def str2bool(v):
 
 
 def main(args):
+
     if args.save_features:
         splits = {"test", "val", "train"}
 
@@ -71,7 +72,7 @@ def main(args):
         model=model,
         mode='av' if args.l2s else 'a',
         drop_av=args.l2s,
-        sc_loss=args.sc_flags,
+        sc_loss=args.sc_flag,
         pesq_loss=args.pesq,
         stoi_loss=args.stoi,
         asr_loss=args.asr,
@@ -95,7 +96,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="AV-PLC training/eval runner (exposes all main() defaults)."
+        description="AV-PLC training/eval runner."
     )
 
     # Training basics
@@ -111,28 +112,24 @@ if __name__ == "__main__":
                    help="Enable STOI loss.")
     g.add_argument("--asr", type=str2bool, default=True, metavar="{true|false}",
                    help="Enable ASR perceptual loss.")
-    g.add_argument("--pretrained-enc", type=str2bool, default=False, metavar="{true|false}",
-                   help="Use a pretrained encoder.")
+    g.add_argument("--sc-flag", type=str2bool, default=False, metavar="{true|false}",
+                   help="Enable spectral-consistency (SC) loss.")
     g.add_argument("--l2s", type=str2bool, default=True, metavar="{true|false}",
                    help="Enable audio-video (lip-to-speech) fusion path (if false, audio-only).")
 
-    # Grid-style options (can pass multiple)
+    # Dataset options
     h = parser.add_argument_group("Dataset options")
     h.add_argument("--datasets", nargs="+",
                    choices=["grid", "lrs2", "voxceleb2"],
                    default=["grid"],
                    help="Datasets to run.")
     h.add_argument("--fusion", nargs="+",
-                   choices=["concat_mlp", "gated_sum", "concat_time", "film", "cross_attn"],
+                   choices=["concat_mlp"],
                    default=["concat_mlp"],
                    help="Fusion modules to try (used when --l2s true).")
     h.add_argument("--plc-loss-rates", nargs="+", default=["60"],
                    metavar="RATE",
                    help="PLC loss rates to evaluate at test time (e.g., 20 30 40 50 60).")
-
-    h.add_argument("--sc-flags", nargs="+", type=str2bool, default=[False],
-                   metavar="{true|false}",
-                   help="List of booleans for spectral-consistency (SC) loss grid.")
 
     # Paths & IO
     p = parser.add_argument_group("Paths")
