@@ -22,9 +22,10 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
                         completion_mel_loss=True, w_completion_mel=1.0,
                         phase_unit_loss=True,
                         phase_temporal_loss=True, phase_frequency_loss=True,
-                        phase_init_checkpoint=None,
+                        phase_complex_loss=True, phase_init_checkpoint=None,
                         w_phase_unit=0.10,
-                        w_phase_temporal=0.05, w_phase_frequency=0.05):
+                        w_phase_temporal=0.05, w_phase_frequency=0.05,
+                        w_phase_complex=0.10):
     set_global_seed(SEED)
     if phase_reconstruction and mode != "av":
         raise ValueError("Learned phase reconstruction is implemented in AV_PLC; use --mode av.")
@@ -33,6 +34,8 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             "--phase-init-checkpoint is incompatible with the latent-only decoder. "
             "Train a fresh latent_spectral_v2 checkpoint instead."
         )
+
+    use_phase_complex_loss = bool(phase_reconstruction and phase_complex_loss)
 
     batch_size = 16
     num_epochs = 100
@@ -59,7 +62,9 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
                   f"{'_pesq_0.01' if pesq_flag else ''}"
                   f"{'_stoi_0.01' if stoi_flag else ''}"
                   f"{'_asr_0.1' if asr_flag else ''}"
-                  f"_latent_spectral_v2{'_phase_recon' if phase_reconstruction else ''}"
+                  f"_latent_spectral_v2"
+                  f"{'_phase_recon' if phase_reconstruction else ''}"
+                  f"{'_complex_v1' if use_phase_complex_loss else ''}"
                   f"({dataset_name})")
     logger = setup_logging(model_name, log_dir)
     logger.info(f"Using device: {device}; Fusion: {fusion_name}")
@@ -124,9 +129,11 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             phase_unit_loss=phase_unit_loss,
             phase_temporal_loss=phase_temporal_loss,
             phase_frequency_loss=phase_frequency_loss,
+            phase_complex_loss=use_phase_complex_loss,
             w_phase_unit=w_phase_unit,
             w_phase_temporal=w_phase_temporal,
             w_phase_frequency=w_phase_frequency,
+            w_phase_complex=w_phase_complex,
         )
 
         start_epoch = trainer.load_checkpoint(load_best=True)
@@ -172,9 +179,11 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             phase_unit_loss=phase_unit_loss,
             phase_temporal_loss=phase_temporal_loss,
             phase_frequency_loss=phase_frequency_loss,
+            phase_complex_loss=use_phase_complex_loss,
             w_phase_unit=w_phase_unit,
             w_phase_temporal=w_phase_temporal,
             w_phase_frequency=w_phase_frequency,
+            w_phase_complex=w_phase_complex,
         )
         trainer.load_checkpoint(os.path.join(checkpoint_dir, model_name, "best_model.pt"))
 
@@ -257,9 +266,15 @@ if __name__ == "__main__":
     parser.add_argument("--no-phase-unit-loss", action="store_true")
     parser.add_argument("--no-phase-temporal-loss", action="store_true")
     parser.add_argument("--no-phase-frequency-loss", action="store_true")
+    parser.add_argument(
+        "--no-phase-complex-loss", action="store_true",
+        help=("Disable projected complex-spectrum consistency. By default it is "
+              "enabled whenever --phase-reconstruction is active."),
+    )
     parser.add_argument("--w-phase-unit", type=float, default=0.10)
     parser.add_argument("--w-phase-temporal", type=float, default=0.05)
     parser.add_argument("--w-phase-frequency", type=float, default=0.05)
+    parser.add_argument("--w-phase-complex", type=float, default=0.10)
     args = parser.parse_args()
 
     av_conformer_runner(mode=args.mode, phase=args.phase,
@@ -273,7 +288,9 @@ if __name__ == "__main__":
                    phase_unit_loss=not args.no_phase_unit_loss,
                    phase_temporal_loss=not args.no_phase_temporal_loss,
                    phase_frequency_loss=not args.no_phase_frequency_loss,
+                   phase_complex_loss=not args.no_phase_complex_loss,
                    phase_init_checkpoint=args.phase_init_checkpoint,
                    w_phase_unit=args.w_phase_unit,
                    w_phase_temporal=args.w_phase_temporal,
-                   w_phase_frequency=args.w_phase_frequency)
+                   w_phase_frequency=args.w_phase_frequency,
+                   w_phase_complex=args.w_phase_complex)

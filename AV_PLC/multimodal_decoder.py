@@ -11,19 +11,19 @@ from AV_PLC.phase_completion import PhaseCompletion
 
 
 class AV_PLC(nn.Module):
-    """AV-PLC with a protected Mel decoder and optional phase-only TF branch.
+    """AV-PLC with three Mel content heads and parallel magnitude/phase TF reconstruction.
 
-    Mel reconstruction is always identical in structure to the no-phase model::
+    Content interface::
 
-      audio-only : A     -> E_A --\
-      video-only : V     -> E_V ----> spectral_temporal -> Mel
-      AV         : F_av  -> E_F --/
+      audio-only : audio encoder Mel head -> M_A
+      video-only : video encoder Mel head -> M_V
+      AV         : fused latent -> existing spectral temporal decoder -> M_AV
 
-    When phase reconstruction is enabled, the completed Mel (observed Mel copied
-    outside PLC gaps and the Mel prediction inside gaps) is converted to an
-    approximate 257-bin linear magnitude and combined with sparse observed phase
-    *after* Mel reconstruction.  Phase therefore cannot alter the Mel forward
-    path.  Controlled phase-only training freezes all inherited Mel parameters.
+    The selected M_A/M_V/M_AV is inverse-Mel projected to linear magnitude.
+    Exact observed STFT magnitude replaces that projection outside PLC gaps.
+    The completed magnitude is concatenated with R*cos(phi), R*sin(phi), passed
+    through TFRefine, and decoded by independent magnitude and phase branches.
+    The inherited content backbone can be frozen while phase_completion.* trains.
     """
 
     def __init__(self, mel_dim=80, feat_dim=256, dropout=0.1,
@@ -37,7 +37,7 @@ class AV_PLC(nn.Module):
                  phase_reconstruction=False, phase_bins=257, phase_decoder_depth=None,
                  phase_channels=64, phase_ts_blocks=2, phase_ts_heads=4,
                  phase_encoder_dense_depth=3, phase_refine_dense_depth=2,
-                 phase_magnitude_compression=1.0,
+                 phase_magnitude_compression=0.3,
     ):
         super().__init__()
         self.phase_reconstruction = bool(phase_reconstruction)
@@ -243,7 +243,8 @@ class AV_PLC(nn.Module):
         return latent, source_ids
 
     def forward(self, dec_input=None, enc_input=None, spk_emb=None,
-                audio_length=None, avail=None, audio_mask=None, phase=None):
+                audio_length=None, avail=None, audio_mask=None, phase=None,
+                stft_magnitude=None):
 
         amel = afeature = vmel = vfeature = None
 
@@ -338,9 +339,9 @@ class AV_PLC(nn.Module):
         )
         target_steps = latent.size(1)
 
-        # R_m and R_phi are identical for audio-present samples in the current
-        # setup: observed audio frames are copied, gaps are predicted.  For
-        # video-only samples a_on=0 makes reliability zero over the full utterance.
+        # Acoustic reliability follows the selected modality semantics.  In strict
+        # video-only mode there is no usable audio anywhere, so R=0 for the whole
+        # utterance.  For audio-only / AV samples, R is the PLC packet mask.
         if dec_input is not None or audio_mask is not None:
             audio_rel = self._audio_reliability(
                 dec_input=dec_input,
@@ -349,76 +350,76 @@ class AV_PLC(nn.Module):
             ).to(latent.device)
         else:
             audio_rel = latent.new_zeros((latent.size(0), target_steps))
-        mel_reliability = audio_rel * a_on.to(audio_rel.dtype).unsqueeze(1)
-        prediction_mask = 1.0 - mel_reliability
+        packet_reliability = audio_rel * a_on.to(audio_rel.dtype).unsqueeze(1)
+        prediction_mask = 1.0 - packet_reliability
 
-        # -------------------------- protected Mel reconstruction --------------------------
+        # -------------------------- three Mel content heads --------------------------
+        # The existing post-fusion temporal decoder provides M_AV.  Audio/video
+        # content uses the encoder Mel heads directly.  This makes M_A/M_V/M_AV a
+        # common normalized-logMel interface for the downstream TF reconstructor.
         hidden, _, _, _ = self.spectral_completion.encode(latent, source_ids)
         hidden = self.spectral_temporal(hidden)
-        predicted_mel, _, _, _, _ = self.spectral_completion.decode(hidden)
+        decoded_mel, _, _, _, _ = self.spectral_completion.decode(hidden)
 
-        if dec_input is None:
-            observed_mel = torch.zeros_like(predicted_mel)
-        else:
-            observed_mel = dec_input.to(device=predicted_mel.device, dtype=predicted_mel.dtype)
-            if observed_mel.size(-1) != predicted_mel.size(-1):
-                raise ValueError(
-                    "Observed Mel and predicted Mel must share the same time axis; "
-                    f"got {observed_mel.size(-1)} and {predicted_mel.size(-1)}"
-                )
-        r_m = mel_reliability.unsqueeze(1).to(predicted_mel.dtype)
-        completed_mel = r_m * observed_mel + (1.0 - r_m) * predicted_mel
+        fused_mel = None
+        if both.any():
+            fused_mel = decoded_mel.new_zeros(decoded_mel.shape)
+            fused_mel[both] = decoded_mel[both]
 
-        # ----------------------------- phase-only TF branch -----------------------------
+        selected_mel = decoded_mel.new_zeros(decoded_mel.shape)
+        only_a = a_on & (~v_on)
+        only_v = (~a_on) & v_on
+        if both.any():
+            selected_mel[both] = decoded_mel[both]
+        if only_a.any():
+            if amel is None:
+                raise RuntimeError("Audio-only sample is missing the audio Mel head")
+            selected_mel[only_a] = amel[only_a]
+        if only_v.any():
+            if vmel is None:
+                raise RuntimeError("Video-only sample is missing the video Mel head")
+            selected_mel[only_v] = vmel[only_v]
+
+        # --------------------- parallel magnitude/phase TF branch ---------------------
         phase_reliability = None
-        p_r = p_i = pred_cos = pred_sin = final_cos = final_sin = None
+        mp_out = None
         if self.phase_reconstruction:
             if self.phase_completion is None:
                 raise RuntimeError("phase_reconstruction=True but phase_completion is missing")
-            if phase is None:
-                raise ValueError("phase is required when phase_reconstruction=True")
-            if phase.size(-1) != target_steps:
+            if phase is None or stft_magnitude is None:
                 raise ValueError(
-                    f"Phase/Mel time mismatch: T_phase={phase.size(-1)}, T_mel={target_steps}"
+                    "phase and stft_magnitude are required for parallel magnitude/phase reconstruction"
                 )
-            if phase.size(1) != self.phase_bins:
+            if phase.size(-1) != target_steps or stft_magnitude.size(-1) != target_steps:
                 raise ValueError(
-                    f"Expected {self.phase_bins} phase bins, got {phase.size(1)}"
+                    "STFT magnitude/phase and Mel content must share the same time axis"
                 )
-            phase_reliability = mel_reliability
-            phase_out = self.phase_completion(
-                completed_mel=completed_mel,
-                phase_radians=phase,
-                phase_reliability=phase_reliability,
-            )
-            p_r = phase_out["p_r"]
-            p_i = phase_out["p_i"]
-            pred_cos = phase_out["pred_cos"]
-            pred_sin = phase_out["pred_sin"]
-            final_cos = phase_out["final_cos"]
-            final_sin = phase_out["final_sin"]
-            phase_reliability = phase_out["phase_reliability"]
+            if phase.size(1) != self.phase_bins or stft_magnitude.size(1) != self.phase_bins:
+                raise ValueError(f"Expected {self.phase_bins} STFT bins")
 
+            phase_reliability = packet_reliability
+            mp_out = self.phase_completion(
+                reconstructed_mel=selected_mel,
+                observed_magnitude=stft_magnitude,
+                phase_radians=phase,
+                reliability=phase_reliability,
+            )
         completion_output = {
-            "predicted_mel": predicted_mel,
-            "completed_mel": completed_mel,
-            "mel_reliability": mel_reliability,
+            # Mel content heads / selected content representation.
+            "predicted_mel": selected_mel,  # compatibility alias
+            "selected_mel": selected_mel,
+            "fused_mel": fused_mel,
+            "audio_mel": amel,
+            "video_mel": vmel,
+            "packet_reliability": packet_reliability,
+            "mel_reliability": packet_reliability,  # compatibility alias
             "prediction_mask": prediction_mask,
             "source_ids": source_ids,
             "phase_reliability": phase_reliability,
-            "p_r": p_r,
-            "p_i": p_i,
-            "pred_cos": pred_cos,
-            "pred_sin": pred_sin,
-            "final_cos": final_cos,
-            "final_sin": final_sin,
         }
-
-        # Keep auxiliary encoder Mel outputs available for optional regularization.
-        # The primary AV output is the unified decoder prediction for AV samples.
-        fused_mel = None
-        if both.any():
-            fused_mel = predicted_mel.new_zeros(predicted_mel.shape)
-            fused_mel[both] = predicted_mel[both]
+        if mp_out is not None:
+            completion_output.update(mp_out)
+            # Compatibility with the previous phase-only trainer/evaluator.
+            completion_output["phase_reliability"] = mp_out["reliability"]
 
         return fused_mel, amel, vmel, completion_output

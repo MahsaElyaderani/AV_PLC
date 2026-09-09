@@ -1,13 +1,14 @@
-"""AV-PLC fusion ablation with a protected Mel path and optional phase_tf_v1.
+"""AV-PLC fusion ablation with a protected Mel path and optional parallel_mp_v1.
 
 No-phase runs preserve the existing latent_spectral_v2 experiment: historical
 concat weights donate only the audio/video encoders, which stay frozen while a
 method-specific fusion + latent-to-Mel decoder is trained.
 
-Phase_tf_v1 runs are deliberately different: each method loads its *complete*
+Parallel_mp_v1 runs are deliberately different: each method loads its *complete*
 trained no-phase checkpoint, freezes every inherited parameter, and trains only
-``phase_completion.*`` with unit/temporal/frequency circular phase losses.
-Observed phase is introduced only after Mel completion.
+``phase_completion.*``. The new module receives inverse-Mel magnitude with exact
+observed magnitude copied outside gaps plus masked phase cosine/sine, then predicts
+magnitude and phase in parallel with magnitude, IP/GD/IAF, complex and waveform losses.
 
 Evaluation uses deterministic single gaps of 160, 500, and 1000 ms by default.
 """
@@ -52,7 +53,7 @@ from AV_PLC.trainer import Trainer
 REPRESENTATIVE_GAPS_MS = [160, 500, 1000]
 JITTER_MAX_FRAMES = 8
 ARCH_VERSION = "latent_spectral_v2"  # Existing Mel architecture/checkpoint namespace.
-PHASE_ARCH_VERSION = "phase_tf_v1"
+PHASE_ARCH_VERSION = "parallel_mp_v1"
 ABLATION_METHODS = (
     "concat",
     "temporal_self_cross_attention",
@@ -105,7 +106,7 @@ def experiment_name(temporal_jitter: bool, phase_reconstruction: bool = False,
 
 
 def phase_model_name(base_model_name: str, phase_complex_loss: bool = False) -> str:
-    """Keep phase_tf_v1 checkpoints separate from every previous phase variant."""
+    """Keep parallel_mp_v1 checkpoints separate from every previous phase variant."""
     return f"{base_model_name}_{PHASE_ARCH_VERSION}"
 
 
@@ -219,7 +220,7 @@ def _load_full_no_phase_checkpoint(model, config, checkpoint_dir):
     base_path = os.path.join(checkpoint_dir, config["base_model_name"], "best_model.pt")
     if not os.path.isfile(base_path):
         raise FileNotFoundError(
-            "phase_tf_v1 requires the corresponding trained no-phase checkpoint. "
+            "parallel_mp_v1 requires the corresponding trained no-phase checkpoint. "
             f"Run this ablation without --phase-reconstruction first. Missing: {base_path}"
         )
     checkpoint = torch.load(base_path, map_location="cpu", weights_only=False)
@@ -234,14 +235,14 @@ def _load_full_no_phase_checkpoint(model, config, checkpoint_dir):
     bad_unexpected = list(incompatible.unexpected_keys)
     if bad_missing or bad_unexpected:
         raise RuntimeError(
-            "No-phase checkpoint is not compatible with phase_tf_v1: "
+            "No-phase checkpoint is not compatible with parallel_mp_v1: "
             f"missing={bad_missing}, unexpected={bad_unexpected}"
         )
     return base_path
 
 
 def build_model(config, shared_encoder_state, args, checkpoint_dir):
-    """Build either the existing Mel ablation or the new frozen-Mel phase experiment."""
+    """Build either the existing Mel ablation or the new frozen-content parallel magnitude/phase experiment."""
     set_global_seed(SEED)
 
     model_kwargs = dict(
@@ -278,7 +279,7 @@ def build_model(config, shared_encoder_state, args, checkpoint_dir):
         for parameter in model.parameters():
             parameter.requires_grad = False
         if model.phase_completion is None:
-            raise RuntimeError("phase_tf_v1 model was constructed without phase_completion")
+            raise RuntimeError("parallel_mp_v1 model was constructed without phase_completion")
         for parameter in model.phase_completion.parameters():
             parameter.requires_grad = True
 
@@ -410,11 +411,16 @@ def build_trainer(config, args, shared_encoder_state, checkpoint_dir, log_dir):
         phase_unit_loss=(args.phase_reconstruction and not args.no_phase_unit_loss),
         phase_temporal_loss=(args.phase_reconstruction and not args.no_phase_temporal_loss),
         phase_frequency_loss=(args.phase_reconstruction and not args.no_phase_frequency_loss),
-        phase_complex_loss=False,
+        phase_complex_loss=args.phase_reconstruction,
+        magnitude_loss=args.phase_reconstruction,
+        waveform_loss=args.phase_reconstruction,
+        content_mel_losses=args.phase_reconstruction,
         w_phase_unit=args.w_phase_unit,
         w_phase_temporal=args.w_phase_temporal,
         w_phase_frequency=args.w_phase_frequency,
-        w_phase_complex=0.0,
+        w_phase_complex=args.w_complex,
+        w_magnitude=args.w_magnitude,
+        w_waveform=args.w_waveform,
         phase_losses_only=args.phase_reconstruction,
         phase_only_training=args.phase_reconstruction,
     )
@@ -426,7 +432,9 @@ def build_trainer(config, args, shared_encoder_state, checkpoint_dir, log_dir):
     assert not trainer.asr_loss
     if args.phase_reconstruction:
         assert not trainer.completion_mel_loss
-        assert not trainer.phase_complex_loss
+        assert trainer.phase_complex_loss
+        assert trainer.magnitude_loss
+        assert trainer.waveform_loss
         assert trainer.phase_losses_only
         assert trainer.phase_only_training
     return trainer
@@ -458,21 +466,25 @@ def save_manifest(trainer, config, args, encoder_sha):
                     "encoder_dense_depth": args.phase_encoder_dense_depth,
                     "refine_dense_depth": args.phase_refine_dense_depth,
                     "magnitude_compression": args.phase_mag_compression,
-                    "input": "[completed inverse-Mel magnitude, R*cos(phi), R*sin(phi)]",
+                    "input": "[completed linear magnitude, R*cos(phi), R*sin(phi)]",
                 }
                 if phase_mode else None
             ),
             "phase_training": (
-                "full method-specific no-phase AV_PLC checkpoint frozen; only phase_completion.* trainable"
+                "full method-specific no-phase AV_PLC content backbone frozen; only parallel magnitude/phase phase_completion.* trainable"
                 if phase_mode
                 else "disabled; latent decoder predicts Mel and evaluation uses Griffin-Lim"
             ),
             "loss_weights": {
-                "completion_mel": 0.0 if phase_mode else 1.0,
-                "phase_unit": args.w_phase_unit if phase_mode else 0.0,
-                "temporal": args.w_phase_temporal if phase_mode else 0.0,
-                "frequency": args.w_phase_frequency if phase_mode else 0.0,
-                "projected_complex": 0.0,
+                "audio_mel_l1": 1.0 if phase_mode else 0.0,
+                "video_mel_l1": 1.0 if phase_mode else 0.0,
+                "fused_mel_l1": 1.0 if phase_mode else 0.0,
+                "magnitude": args.w_magnitude if phase_mode else 0.0,
+                "phase_ip": args.w_phase_unit if phase_mode else 0.0,
+                "phase_iaf": args.w_phase_temporal if phase_mode else 0.0,
+                "phase_gd": args.w_phase_frequency if phase_mode else 0.0,
+                "complex": args.w_complex if phase_mode else 0.0,
+                "waveform": args.w_waveform if phase_mode else 0.0,
             },
             "training_mask": "bursty GE; per-access loss rate uniform in [0.3, 0.9]",
             "validation_mask": "stable bursty GE; seed=SEED; range [0.3, 0.9]",
@@ -486,7 +498,7 @@ def save_manifest(trainer, config, args, encoder_sha):
             "jitter_probability_train_val": 0.5 if args.temporal_jitter else 0.0,
             "jitter_max_frames": JITTER_MAX_FRAMES if args.temporal_jitter else 0,
             "loss": (
-                "phase-only circular objective: unit + temporal-difference + frequency-difference; Mel frozen"
+                "parallel M/P objective: Mel-head L1 + magnitude + IP/GD/IAF + complex + waveform; content backbone frozen"
                 if phase_mode
                 else "masked absolute log-Mel reconstruction only; pretrained encoders frozen"
             ),
@@ -508,7 +520,7 @@ def save_manifest(trainer, config, args, encoder_sha):
             "jitter_probability": 1.0 if args.temporal_jitter else 0.0,
             "jitter_max_frames": JITTER_MAX_FRAMES if args.temporal_jitter else 0,
             "test_seed": SEED,
-            "output": "frozen Mel + phase_tf_v1" if phase_mode else "latent-decoder Mel",
+            "output": "frozen Mel + parallel_mp_v1" if phase_mode else "latent-decoder Mel",
             "waveform_reconstruction": (
                 "frozen completed Mel + predicted unit phase + overlap-add iSTFT"
                 if phase_mode else "Griffin-Lim"
@@ -893,7 +905,7 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
                 "global_local_affinity": "GLA",
             }.get(method, method)
             label_variant = (
-                "frozen Mel + phase_tf_v1"
+                "frozen Mel + parallel_mp_v1"
                 if variant == "learned_phase"
                 else "latent Mel + Griffin-Lim"
             )
@@ -904,7 +916,7 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
                 linestyle="-" if variant == "learned_phase" else "--",
                 label=f"{label_method} — {label_variant}",
             )
-        ax.set_title("Frozen Mel + phase_tf_v1 vs no-phase Mel + Griffin-Lim")
+        ax.set_title("Frozen Mel + parallel_mp_v1 vs no-phase Mel + Griffin-Lim")
         ax.set_xlabel("Audio gap duration (ms)")
         ax.set_ylabel(ylabel)
         ax.set_xticks(range(len(ordered_gaps)), [str(g) for g in ordered_gaps])
@@ -985,7 +997,7 @@ def parse_args():
     )
     parser.add_argument(
         "--phase-batch-size", type=int, default=1,
-        help=("Batch size used only by phase_tf_v1. Axial TS-Conformer attention at "
+        help=("Batch size used only by parallel_mp_v1. Axial TS-Conformer attention at "
               "F=257,T≈300 is much heavier than the Mel ablation; increase only if memory allows."),
     )
     parser.add_argument("--phase-channels", type=int, default=64)
@@ -994,9 +1006,11 @@ def parse_args():
     parser.add_argument("--phase-encoder-dense-depth", type=int, default=3)
     parser.add_argument("--phase-refine-dense-depth", type=int, default=2)
     parser.add_argument(
-        "--phase-mag-compression", type=float, default=1.0,
-        help=("Exponent applied to inverse-Mel linear magnitude before the phase encoder. "
-              "1.0 matches the current proposal; 0.3 is an optional MP-SENet-inspired ablation."),
+        "--phase-mag-compression", type=float, default=0.3,
+        help=("Power-compression exponent c used for TFRefine magnitude input, "
+              "magnitude-head target/output, and L_mag. Default 0.3; use 1.0 for "
+              "the no-compression ablation. Physical magnitude is recovered before "
+              "complex/waveform reconstruction."),
     )
     parser.add_argument("--no-phase-unit-loss", action="store_true")
     parser.add_argument("--no-phase-temporal-loss", action="store_true")
@@ -1005,6 +1019,9 @@ def parse_args():
     parser.add_argument("--w-phase-unit", type=float, default=0.10)
     parser.add_argument("--w-phase-temporal", type=float, default=0.05)
     parser.add_argument("--w-phase-frequency", type=float, default=0.05)
+    parser.add_argument("--w-magnitude", type=float, default=1.0)
+    parser.add_argument("--w-complex", type=float, default=0.10)
+    parser.add_argument("--w-waveform", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -1025,7 +1042,7 @@ def main():
     if args.phase_mag_compression <= 0.0:
         raise ValueError("--phase-mag-compression must be > 0")
 
-    phase_complex_loss = False  # phase_tf_v1 intentionally excludes projected complex loss.
+    phase_complex_loss = bool(args.phase_reconstruction)
 
     log_dir = project_log_dir("AV_PLC")
     os.makedirs(log_dir, exist_ok=True)
@@ -1191,7 +1208,7 @@ if __name__ == "__main__":
 #     --train-subset 5000 --val-subset 500 --test-subset 500 \
 #     --num-epochs 50
 #
-# 2) Freeze each complete no-phase model and train only phase_tf_v1:
+# 2) Freeze each complete no-phase model and train only parallel_mp_v1:
 #
 # python AV_PLC/ablation_fusion.py \
 #     --dataset grid \
@@ -1202,5 +1219,5 @@ if __name__ == "__main__":
 #     --force-train concat temporal_self_cross_attention global_local_affinity
 #
 # Add --temporal-jitter for the jitter-8 condition.
-# phase_tf_v1 uses only unit + temporal + frequency circular phase losses.
+# parallel_mp_v1 uses magnitude, IP/GD/IAF, complex, and waveform losses.
 # -----------------------------------------------------------------------------

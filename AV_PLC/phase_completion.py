@@ -112,14 +112,36 @@ class TSConformerBlock(nn.Module):
 
 
 class PhaseCompletion(nn.Module):
-    """Predict missing STFT phase from completed Mel magnitude + observed phase."""
+    """Parallel magnitude/phase TF reconstruction for AV_PLC.
+
+    The content branch supplies one reconstructed normalized log-Mel estimate
+    (audio-only, video-only, or AV-fused).  It is inverted with the fixed Slaney
+    Mel pseudo-inverse.  Exact observed linear STFT magnitude is then copied into
+    reliable frames, while only PLC-gap frames use the inverse-Mel estimate.
+
+    TFRefine input channels are exactly::
+
+        [A_completed**c, R*cos(phi_obs), R*sin(phi_obs)]
+
+    with c=0.3 by default.  The magnitude head predicts A**c, not raw A.
+    It is decompressed back to physical linear STFT magnitude before complex-STFT
+    construction, waveform reconstruction, and final observed-bin preservation.
+
+    A shared 2-D Conv -> dense TF encoder -> axial time/frequency Conformer stack
+    is followed by two independent branches:
+
+        magnitude branch -> predicted compressed magnitude A**c
+        phase branch     -> unit-circle (cos, sin)
+
+    For the final PLC spectrum, observed magnitude and phase are copied exactly
+    outside the gap.  Raw branch predictions are retained for masked losses.
+    """
 
     def __init__(self, mel_dim: int = 80, phase_bins: int = 257, sample_rate: int = 16000,
                  n_fft: int = 512, channels: int = 64, num_ts_blocks: int = 2, num_heads: int = 4,
                  encoder_dense_depth: int = 3, decoder_dense_depth: int = 2, dropout: float = 0.1,
-                 magnitude_compression: float = 1.0, mel_mean: float = -56.775, mel_std: float = 19.707,
+                 magnitude_compression: float = 0.3, mel_mean: float = -56.775, mel_std: float = 19.707,
                  eps: float = 1e-8,) -> None:
-
         super().__init__()
         if phase_bins != n_fft // 2 + 1:
             raise ValueError(f"phase_bins must equal n_fft//2+1; got {phase_bins} for n_fft={n_fft}")
@@ -136,108 +158,151 @@ class PhaseCompletion(nn.Module):
         self.magnitude_compression = float(magnitude_compression)
         self.eps = float(eps)
 
-        # Fixed Slaney Mel pseudo-inverse:
-        mel_fb = torchaudio.functional.melscale_fbanks(n_freqs=self.phase_bins,
-                                                       f_min=0.0, f_max=float(sample_rate) / 2.0,
-                                                       n_mels=self.mel_dim, sample_rate=sample_rate,
-                                                       norm="slaney", mel_scale="slaney",)  # [F, M]
-        mel_pinv = torch.linalg.pinv(mel_fb).float()  # [M, F]
+        mel_fb = torchaudio.functional.melscale_fbanks(
+            n_freqs=self.phase_bins, f_min=0.0, f_max=float(sample_rate) / 2.0,
+            n_mels=self.mel_dim, sample_rate=sample_rate,
+            norm="slaney", mel_scale="slaney",
+        )  # [F,M]
+        mel_pinv = torch.linalg.pinv(mel_fb).float()  # [M,F]
         self.register_buffer("mel_pinv", mel_pinv, persistent=True)
         self.register_buffer("mel_mean", torch.tensor(float(mel_mean)), persistent=True)
         self.register_buffer("mel_std", torch.tensor(float(mel_std)), persistent=True)
 
-        # Joint magnitude/observed-phase encoder.  No stride/pooling: F,T preserved.
-        self.tf_stem = nn.Sequential(nn.Conv2d(3, self.channels, kernel_size=1),
-                                     nn.InstanceNorm2d(self.channels, affine=True),
-                                     nn.PReLU(self.channels),)
+        # Shared TFRefine trunk: 3 channels = completed magnitude, masked cos, masked sin.
+        self.tf_stem = nn.Sequential(
+            nn.Conv2d(3, self.channels, kernel_size=1),
+            nn.InstanceNorm2d(self.channels, affine=True),
+            nn.PReLU(self.channels),
+        )
         self.tf_dense = DilatedDenseTFBlock(self.channels, depth=encoder_dense_depth)
+        self.ts_blocks = nn.ModuleList([
+            TSConformerBlock(
+                channels=self.channels, heads=num_heads,
+                dropout=dropout, conv_kernel_size=15,
+            )
+            for _ in range(num_ts_blocks)
+        ])
 
-        self.ts_blocks = nn.ModuleList([TSConformerBlock(channels=self.channels, heads=num_heads,
-                                                         dropout=dropout, conv_kernel_size=15,)
-                                        for _ in range(num_ts_blocks)])
+        # Independent magnitude branch.
+        self.mag_refine = DilatedDenseTFBlock(self.channels, depth=decoder_dense_depth)
+        self.mag_post = nn.Sequential(
+            nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=1),
+            nn.InstanceNorm2d(self.channels, affine=True),
+            nn.PReLU(self.channels),
+        )
+        self.mag_head = nn.Conv2d(self.channels, 1, kernel_size=1)
+        self.mag_positive = nn.Softplus()
 
-        # Phase-specific local refinement.  Unlike MP-SENet, no transpose/upscale
-        # layer is needed because the encoder never downsamples frequency.
+        # Independent phase branch.
         self.phase_refine = DilatedDenseTFBlock(self.channels, depth=decoder_dense_depth)
-        self.phase_post = nn.Sequential(nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=1),
-                                        nn.InstanceNorm2d(self.channels, affine=True),
-                                        nn.PReLU(self.channels),)
-
-        # Keep the full hidden width until the two physical phase outputs.
+        self.phase_post = nn.Sequential(
+            nn.Conv2d(self.channels, self.channels, kernel_size=3, padding=1),
+            nn.InstanceNorm2d(self.channels, affine=True),
+            nn.PReLU(self.channels),
+        )
         self.phase_real = nn.Conv2d(self.channels, 1, kernel_size=1)
         self.phase_imag = nn.Conv2d(self.channels, 1, kernel_size=1)
 
     @torch.no_grad()
     def set_mel_stats(self, mel_mean: float, mel_std: float) -> None:
-        """Update normalization statistics from the active AV_PLC dataset."""
         if mel_std <= 0.0:
             raise ValueError("mel_std must be > 0")
         self.mel_mean.copy_(self.mel_mean.new_tensor(float(mel_mean)))
         self.mel_std.copy_(self.mel_std.new_tensor(float(mel_std)))
 
-    def mel_to_linear_magnitude(self, completed_mel: torch.Tensor) -> torch.Tensor:
-        """Fixed normalized-Mel -> approximate linear magnitude [B,257,T]."""
-        if completed_mel.dim() != 3 or completed_mel.size(1) != self.mel_dim:
-            raise ValueError(f"completed_mel must be [B,{self.mel_dim},T], got {tuple(completed_mel.shape)}")
-
-        # Do the fixed pseudo-inverse in FP32 even under AMP/BF16; the resulting
-        # feature is cast back before the learned encoder.
-        mel_f = completed_mel.float()
+    def mel_to_linear_magnitude(self, reconstructed_mel: torch.Tensor) -> torch.Tensor:
+        """Differentiable normalized-logMel -> approximate linear magnitude [B,F,T]."""
+        if reconstructed_mel.dim() != 3 or reconstructed_mel.size(1) != self.mel_dim:
+            raise ValueError(
+                f"reconstructed_mel must be [B,{self.mel_dim},T], got {tuple(reconstructed_mel.shape)}"
+            )
+        mel_f = reconstructed_mel.float()
         mel_db = mel_f * self.mel_std.float() + self.mel_mean.float()
         mel_mag = torchaudio.functional.DB_to_amplitude(mel_db, ref=1.0, power=0.5)
         linear_mag = torch.matmul(self.mel_pinv.t(), mel_mag).clamp_min(self.eps)
-        if self.magnitude_compression != 1.0:
-            linear_mag = linear_mag.pow(self.magnitude_compression)
         return linear_mag
 
-    def forward(self, completed_mel: torch.Tensor, phase_radians: torch.Tensor,
-                phase_reliability: torch.Tensor,) -> dict[str, torch.Tensor]:
+    def forward(self, reconstructed_mel: torch.Tensor, observed_magnitude: torch.Tensor,
+                phase_radians: torch.Tensor, reliability: torch.Tensor,) -> dict[str, torch.Tensor]:
         if phase_radians.dim() != 3 or phase_radians.size(1) != self.phase_bins:
             raise ValueError(f"phase_radians must be [B,{self.phase_bins},T], got {tuple(phase_radians.shape)}")
-        if completed_mel.size(0) != phase_radians.size(0) or completed_mel.size(-1) != phase_radians.size(-1):
-            raise ValueError("completed_mel and phase_radians must share batch/time axes")
-        if phase_reliability.shape != (completed_mel.size(0), completed_mel.size(-1)):
-            raise ValueError(f"phase_reliability must be [B,T], got {tuple(phase_reliability.shape)}")
+        if observed_magnitude.shape != phase_radians.shape:
+            raise ValueError(
+                f"observed_magnitude must match phase shape {tuple(phase_radians.shape)}, "
+                f"got {tuple(observed_magnitude.shape)}"
+            )
+        if reconstructed_mel.size(0) != phase_radians.size(0) or reconstructed_mel.size(-1) != phase_radians.size(-1):
+            raise ValueError("reconstructed_mel and phase_radians must share batch/time axes")
+        if reliability.shape != (reconstructed_mel.size(0), reconstructed_mel.size(-1)):
+            raise ValueError(f"reliability must be [B,T], got {tuple(reliability.shape)}")
 
-        reliability = phase_reliability.to(device=completed_mel.device,
-                                           dtype=torch.float32).clamp(0.0, 1.0)
-        phase = phase_radians.to(device=completed_mel.device, dtype=torch.float32)
+        rel = reliability.to(device=reconstructed_mel.device, dtype=torch.float32).clamp(0.0, 1.0)
+        phase = phase_radians.to(device=reconstructed_mel.device, dtype=torch.float32)
+        observed_mag = observed_magnitude.to(device=reconstructed_mel.device, dtype=torch.float32).clamp_min(0.0)
 
-        # Multiply circular coordinates by R *after* sin/cos.  Missing phase is
-        # therefore represented by [0,0], not by the false angle zero.
-        r_tf = reliability[:, None, None, :]  # [B,1,1,T]
-        observed_cos = torch.cos(phase)[:, None, :, :] * r_tf
-        observed_sin = torch.sin(phase)[:, None, :, :] * r_tf
+        # Inverse-Mel only proposes the missing region.  Reliable magnitude remains exact.
+        inverse_mel_mag = self.mel_to_linear_magnitude(reconstructed_mel)
+        r = rel[:, None, :]  # [B,1,T], broadcasts over F
+        completed_mag = r * observed_mag + (1.0 - r) * inverse_mel_mag
 
-        linear_mag = self.mel_to_linear_magnitude(completed_mel)[:, None, :, :]
-        y_phi = torch.cat([linear_mag, observed_cos, observed_sin], dim=1)
-        y_phi = y_phi.to(dtype=completed_mel.dtype)
+        # MP-SENet-style power compression.  TFRefine works in the compressed
+        # magnitude domain because raw STFT magnitude has a very large dynamic range.
+        # c=0.3 is the default; c=1.0 remains available as the no-compression ablation.
+        network_mag = completed_mag.clamp_min(self.eps).pow(self.magnitude_compression)
 
-        hidden = self.tf_stem(y_phi)
+        # Mask phase after sin/cos so a missing phase is [0,0], not the false angle 0.
+        observed_cos = torch.cos(phase) * r
+        observed_sin = torch.sin(phase) * r
+
+        y = torch.stack([network_mag, observed_cos, observed_sin], dim=1)  # [B,3,F,T]
+        y = y.to(dtype=reconstructed_mel.dtype)
+
+        hidden = self.tf_stem(y)
         hidden = hidden + self.tf_dense(hidden)
         for block in self.ts_blocks:
             hidden = block(hidden)
 
-        hidden = hidden + self.phase_refine(hidden)
-        hidden = self.phase_post(hidden)
+        # Magnitude head: predict *compressed* absolute magnitude directly, not a
+        # multiplicative mask.  Decompress only when a physical STFT magnitude is
+        # needed for the final complex spectrum / waveform.
+        mag_hidden = hidden + self.mag_refine(hidden)
+        mag_hidden = self.mag_post(mag_hidden)
+        predicted_mag_compressed = self.mag_positive(self.mag_head(mag_hidden).squeeze(1)).float()
+        predicted_mag = predicted_mag_compressed.clamp_min(self.eps).pow(1.0 / self.magnitude_compression)
 
-        p_r = self.phase_real(hidden).squeeze(1)  # [B,F,T]
-        p_i = self.phase_imag(hidden).squeeze(1)
+        # Phase head: two unconstrained Cartesian auxiliaries -> unit-circle phase.
+        phase_hidden = hidden + self.phase_refine(hidden)
+        phase_hidden = self.phase_post(phase_hidden)
+        p_r = self.phase_real(phase_hidden).squeeze(1).float()
+        p_i = self.phase_imag(phase_hidden).squeeze(1).float()
         norm = torch.sqrt(p_r.square() + p_i.square() + self.eps)
         pred_cos = p_r / norm
         pred_sin = p_i / norm
+        pred_phase = torch.atan2(pred_sin, pred_cos)
 
-        # Restore exact observed phase; prediction is used only where R=0.
-        r = reliability[:, None, :].to(dtype=pred_cos.dtype)
-        obs_c = observed_cos.squeeze(1).to(dtype=pred_cos.dtype)
-        obs_s = observed_sin.squeeze(1).to(dtype=pred_sin.dtype)
-        final_cos = obs_c + (1.0 - r) * pred_cos
-        final_sin = obs_s + (1.0 - r) * pred_sin
+        # Final PLC output preserves every reliable STFT bin exactly.
+        final_mag = r * observed_mag + (1.0 - r) * predicted_mag
+        final_cos = observed_cos + (1.0 - r) * pred_cos
+        final_sin = observed_sin + (1.0 - r) * pred_sin
         final_norm = torch.sqrt(final_cos.square() + final_sin.square() + self.eps)
         final_cos = final_cos / final_norm
         final_sin = final_sin / final_norm
+        final_phase = torch.atan2(final_sin, final_cos)
 
-        return {"p_r": p_r, "p_i": p_i,
-                "pred_cos": pred_cos, "pred_sin": pred_sin,
-                "final_cos": final_cos, "final_sin": final_sin,
-                "phase_reliability": reliability,}
+        return {
+            "inverse_mel_mag": inverse_mel_mag,
+            "completed_input_mag": completed_mag,
+            "completed_input_mag_compressed": network_mag,
+            "predicted_mag_compressed": predicted_mag_compressed,
+            "predicted_mag": predicted_mag,
+            "final_mag": final_mag,
+            "p_r": p_r,
+            "p_i": p_i,
+            "pred_cos": pred_cos,
+            "pred_sin": pred_sin,
+            "pred_phase": pred_phase,
+            "final_cos": final_cos,
+            "final_sin": final_sin,
+            "final_phase": final_phase,
+            "reliability": rel,
+        }

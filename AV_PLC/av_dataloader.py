@@ -154,21 +154,27 @@ class AVDataset(Dataset):
             audio_length = 0 #h5f.attrs.get(f"{video_key}/audio_len", None)
             text = h5f[f"{video_key}/text"][:]
             mel_spec = h5f[f"{video_key}/spec"][:].astype(np.float32)
-            phase = None
+            phase = stft_magnitude = None
             if self.phase_reconstruction:
                 phase_key = f"{video_key}/phase"
-                if phase_key not in h5f:
+                magnitude_key = f"{video_key}/stft_magnitude"
+                if phase_key not in h5f or magnitude_key not in h5f:
                     raise KeyError(
-                        f"Missing {phase_key}. Run AV_PLC/precompute_phase.py first."
+                        f"Missing {phase_key} or {magnitude_key}. "
+                        "Run AV_PLC/precompute_phase.py first."
                     )
                 phase = h5f[phase_key][:].astype(np.float32)
+                stft_magnitude = h5f[magnitude_key][:].astype(np.float32)
                 if phase.ndim != 2 or phase.shape[0] != 257:
+                    raise ValueError(f"Expected phase [257,T], got {phase.shape} for {video_key}")
+                if stft_magnitude.shape != phase.shape:
                     raise ValueError(
-                        f"Expected phase [257,T], got {phase.shape} for {video_key}"
+                        f"STFT magnitude/phase mismatch for {video_key}: "
+                        f"{stft_magnitude.shape} vs {phase.shape}"
                     )
                 if phase.shape[-1] != mel_spec.shape[-1]:
                     raise ValueError(
-                        f"Phase/Mel time mismatch for {video_key}: "
+                        f"STFT/Mel time mismatch for {video_key}: "
                         f"{phase.shape[-1]} vs {mel_spec.shape[-1]}"
                     )
 
@@ -220,7 +226,7 @@ class AVDataset(Dataset):
 
             if self.mode == 'a':
                 if self.phase_reconstruction:
-                    return masked_spec, mel_spec, phase, audio_length, text, mask, video_path
+                    return masked_spec, mel_spec, stft_magnitude, phase, audio_length, text, mask, video_path
                 return masked_spec, mel_spec, audio_length, text, mask, video_path
 
             if self.mode == 'motion':
@@ -244,9 +250,11 @@ class AVDataset(Dataset):
                 frames = self._aug_video_frames(frames)
                 video_aligned_spec = self._video_aligned_target(mel_spec, num_video_frames,)
                 if self.phase_reconstruction:
+                    video_aligned_magnitude = self._video_aligned_target(stft_magnitude, num_video_frames,)
                     video_aligned_phase = self._video_aligned_target(phase, num_video_frames,)
-                    return (frames, spk_emb, mel_spec, video_aligned_spec, phase,
-                            video_aligned_phase, audio_length, text, mask, video_path)
+                    return (frames, spk_emb, mel_spec, video_aligned_spec,
+                            stft_magnitude, video_aligned_magnitude, phase, video_aligned_phase,
+                            audio_length, text, mask, video_path)
                 return frames, spk_emb, mel_spec, video_aligned_spec, audio_length,text, mask, video_path
 
             if self.mode == 'av':
@@ -258,6 +266,10 @@ class AVDataset(Dataset):
                 num_video_frames = frames.shape[0]
                 frames = self._aug_video_frames(frames)
                 video_aligned_spec = self._video_aligned_target(mel_spec, num_video_frames, )
+                video_aligned_magnitude = (
+                    self._video_aligned_target(stft_magnitude, num_video_frames,)
+                    if self.phase_reconstruction else None
+                )
                 video_aligned_phase = (
                     self._video_aligned_target(phase, num_video_frames,)
                     if self.phase_reconstruction else None
@@ -269,7 +281,8 @@ class AVDataset(Dataset):
                 #return frames, spk_emb, masked_spec, mel_spec, audio_length, text, mask, video_path, avail
                 if self.phase_reconstruction:
                     return (frames, spk_emb, masked_spec, mel_spec, video_aligned_spec,
-                            phase, video_aligned_phase, audio_length, text, mask, video_path, avail)
+                            stft_magnitude, video_aligned_magnitude, phase, video_aligned_phase,
+                            audio_length, text, mask, video_path, avail)
                 return frames, spk_emb, masked_spec, mel_spec, video_aligned_spec, audio_length, text, mask, video_path, avail
             raise NotImplementedError(f"Unsupported mode: {self.mode}")
 

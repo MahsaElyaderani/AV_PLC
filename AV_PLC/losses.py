@@ -279,3 +279,135 @@ class ComplexSpectrumConsistencyLoss(nn.Module):
         denominator = (target_mag.abs() * mask).sum().clamp_min(self.eps)
 
         return numerator / denominator
+# --------------------------------------------------------------------------------------
+# parallel magnitude/phase PLC losses
+# --------------------------------------------------------------------------------------
+
+class MagnitudeReconstructionLoss(nn.Module):
+    """Masked L1 in the power-compressed STFT-magnitude domain.
+
+    ``pred_mag_compressed`` is the magnitude-head output, representing A**c.
+    The clean physical target magnitude is compressed with the same exponent
+    before comparison.  c=0.3 is the default; c=1.0 is the no-compression ablation.
+    """
+
+    def __init__(self, compression: float = 0.3, eps: float = 1e-8):
+        super().__init__()
+        if compression <= 0.0:
+            raise ValueError("compression must be > 0")
+        self.compression = float(compression)
+        self.eps = float(eps)
+
+    def forward(self, pred_mag_compressed, target_mag, prediction_mask=None):
+        target_mag = target_mag.to(
+            device=pred_mag_compressed.device, dtype=pred_mag_compressed.dtype
+        ).clamp_min(0.0)
+        target_compressed = target_mag.clamp_min(self.eps).pow(self.compression)
+        return _masked_mean(
+            (pred_mag_compressed - target_compressed).abs(), prediction_mask
+        )
+
+
+def istft_overlap_add(complex_spec: torch.Tensor, n_fft: int = 512,
+                  win_length: int = 400, hop_length: int = 160,
+                  pad: int = 176, eps: float = 1e-8) -> torch.Tensor:
+    """Differentiable overlap-add iSTFT matching AV_PLC's current STFT geometry.
+
+    PyTorch's ``istft(center=False)`` can reject zero-ended Hann coverage at the
+    padded boundaries.  The dataset intentionally pads 176 samples at both ends,
+    so we perform explicit overlap-add and crop those padding samples afterward.
+    """
+    if complex_spec.dim() != 3:
+        raise ValueError(f"complex_spec must be [B,F,T], got {tuple(complex_spec.shape)}")
+    if complex_spec.size(1) != n_fft // 2 + 1:
+        raise ValueError(f"Expected {n_fft // 2 + 1} frequency bins")
+
+    b, _, t = complex_spec.shape
+    frames = torch.fft.irfft(complex_spec.transpose(1, 2), n=n_fft, dim=-1)  # [B,T,N]
+
+    win = torch.hann_window(win_length, periodic=True, device=frames.device, dtype=frames.dtype)
+    left = (n_fft - win_length) // 2
+    right = n_fft - win_length - left
+    win = torch.nn.functional.pad(win, (left, right))
+
+    out_len = n_fft + hop_length * (t - 1)
+    output = frames.new_zeros((b, out_len))
+    denom = frames.new_zeros((out_len,))
+    win_sq = win.square()
+
+    for i in range(t):
+        start = i * hop_length
+        output[:, start:start + n_fft] = output[:, start:start + n_fft] + frames[:, i, :] * win
+        denom[start:start + n_fft] = denom[start:start + n_fft] + win_sq
+
+    output = output / denom.clamp_min(eps).unsqueeze(0)
+    if pad > 0:
+        if output.size(-1) <= 2 * pad:
+            raise ValueError("iSTFT output is shorter than requested boundary crop")
+        output = output[:, pad:-pad]
+    return output
+
+
+class WaveformReconstructionLoss(nn.Module):
+    """Waveform L1 after differentiable magnitude+phase synthesis."""
+
+    def __init__(self, n_fft: int = 512, win_length: int = 400,
+                 hop_length: int = 160, pad: int = 176, eps: float = 1e-8):
+        super().__init__()
+        self.n_fft = int(n_fft)
+        self.win_length = int(win_length)
+        self.hop_length = int(hop_length)
+        self.pad = int(pad)
+        self.eps = float(eps)
+
+    def forward(self, pred_mag, pred_cos, pred_sin, target_mag, target_phase):
+        target_mag = target_mag.to(device=pred_mag.device, dtype=pred_mag.dtype)
+        target_phase = target_phase.to(device=pred_mag.device, dtype=pred_mag.dtype)
+        pred_complex = torch.complex(pred_mag * pred_cos, pred_mag * pred_sin)
+        target_complex = torch.polar(target_mag, target_phase)
+
+        pred_wav = istft_overlap_add(
+            pred_complex, self.n_fft, self.win_length, self.hop_length, self.pad, self.eps
+        )
+        target_wav = istft_overlap_add(
+            target_complex, self.n_fft, self.win_length, self.hop_length, self.pad, self.eps
+        )
+        return torch.nn.functional.l1_loss(pred_wav, target_wav)
+
+# MP-SENet-style anti-wrapping phase losses used by the new parallel M/P stage.
+def anti_wrapping_error(delta: torch.Tensor) -> torch.Tensor:
+    two_pi = delta.new_tensor(2.0 * torch.pi)
+    return (delta - two_pi * torch.round(delta / two_pi)).abs()
+
+
+class InstantaneousPhaseLoss(nn.Module):
+    """L_IP: anti-wrapped pointwise phase error."""
+    def forward(self, pred_phase, target_phase, prediction_mask=None):
+        target_phase = target_phase.to(device=pred_phase.device, dtype=pred_phase.dtype)
+        return _masked_mean(anti_wrapping_error(pred_phase - target_phase), prediction_mask)
+
+
+class GroupDelayPhaseLoss(nn.Module):
+    """L_GD: anti-wrapped adjacent-frequency phase-difference error."""
+    def forward(self, pred_phase, target_phase, prediction_mask=None):
+        target_phase = target_phase.to(device=pred_phase.device, dtype=pred_phase.dtype)
+        if pred_phase.size(1) < 2:
+            return pred_phase.new_tensor(0.0)
+        pred_delta = pred_phase[:, 1:, :] - pred_phase[:, :-1, :]
+        target_delta = target_phase[:, 1:, :] - target_phase[:, :-1, :]
+        return _masked_mean(anti_wrapping_error(pred_delta - target_delta), prediction_mask)
+
+
+class InstantaneousAngularFrequencyLoss(nn.Module):
+    """L_IAF: anti-wrapped adjacent-time phase-difference error."""
+    def forward(self, pred_phase, target_phase, prediction_mask=None):
+        target_phase = target_phase.to(device=pred_phase.device, dtype=pred_phase.dtype)
+        if pred_phase.size(-1) < 2:
+            return pred_phase.new_tensor(0.0)
+        pred_delta = pred_phase[..., 1:] - pred_phase[..., :-1]
+        target_delta = target_phase[..., 1:] - target_phase[..., :-1]
+        pair_mask = None
+        if prediction_mask is not None:
+            pm = prediction_mask.to(device=pred_phase.device, dtype=pred_phase.dtype)
+            pair_mask = torch.maximum(pm[..., :-1], pm[..., 1:])
+        return _masked_mean(anti_wrapping_error(pred_delta - target_delta), pair_mask)
