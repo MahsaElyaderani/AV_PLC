@@ -49,8 +49,9 @@ from torch.utils.data import DataLoader
 
 from av_dataloader import AVDataloader
 from multimodal_decoder import AV_PLC
-from shared.audio_processing import librosa_mel2audio, load_audio_ffmpeg
+from shared.audio_processing import librosa_mel2audio
 from shared.metrics import calculate_pesq, calculate_stoi
+from AV_PLC.batch_utils import split_waveform_aux
 
 
 mpl.rcParams.update({
@@ -289,10 +290,9 @@ def get_dataset_stats(loader: DataLoader) -> Tuple[float, float]:
         dataset = dataset.base_dataset
     while hasattr(dataset, "dataset"):
         dataset = dataset.dataset
-    return (
-        float(getattr(dataset, "mel_mean", -56.775)),
-        float(getattr(dataset, "mel_std", 19.707)),
-    )
+    if not hasattr(dataset, "mel_mean") or not hasattr(dataset, "mel_std"):
+        raise RuntimeError("AV_PLC dataset is missing active mel_mean/mel_std; generate AV_PLC/mel_stats/<dataset>.json first.")
+    return float(dataset.mel_mean), float(dataset.mel_std)
 
 
 def insert_reconstructed_gap(original_audio, reconstructed_audio, mask, hop_length: int = HOP_LENGTH):
@@ -301,9 +301,9 @@ def insert_reconstructed_gap(original_audio, reconstructed_audio, mask, hop_leng
     reconstructed = np.asarray(reconstructed_audio, dtype=np.float32).squeeze()
 
     if torch.is_tensor(mask):
-        time_keep = mask[0].detach().cpu().numpy().astype(np.float32)
+        time_keep = mask.detach().cpu().numpy().astype(np.float32).squeeze()
     else:
-        time_keep = np.asarray(mask[0], dtype=np.float32)
+        time_keep = np.asarray(mask, dtype=np.float32).squeeze()
 
     waveform_mask = np.repeat(time_keep, hop_length)
     length = min(len(original), len(reconstructed), len(waveform_mask))
@@ -403,9 +403,9 @@ def _forward_in_chunks(
     model,
     masked_spec,
     frames,
-    spk_emb,
     audio_length,
     avail,
+    audio_mask,
     chunk_size: int,
 ):
     outputs = []
@@ -417,9 +417,10 @@ def _forward_in_chunks(
         fused_mel, _, _ = model(
             masked_spec[start:end],
             frames[start:end],
-            spk_emb[start:end],
+            None,
             length_chunk,
             avail=avail[start:end],
+            audio_mask=audio_mask[start:end],
         )
         outputs.append(fused_mel.detach().cpu())
     return torch.cat(outputs, dim=0)
@@ -446,6 +447,7 @@ def evaluate_sync_offsets(
     condition_count = len(offsets_ms)
 
     for batch_idx, batch in enumerate(loader):
+        core, clean_audio, sample_mask, _frame_valid, _soft_keep = split_waveform_aux(batch)
         (
             frames,
             spk_emb,
@@ -457,7 +459,7 @@ def evaluate_sync_offsets(
             mask,
             video_path,
             avail,
-        ) = batch
+        ) = core
 
         batch_size = int(frames.size(0))
         expanded_frames = []
@@ -492,8 +494,8 @@ def evaluate_sync_offsets(
 
         expanded_frames = torch.stack(expanded_frames, dim=0).to(device, non_blocking=True)
         expanded_masked = _repeat_batch_value(masked_spec, condition_count).to(device, non_blocking=True).float()
-        expanded_spk = _repeat_batch_value(spk_emb, condition_count).to(device, non_blocking=True).float()
         expanded_avail = _repeat_batch_value(avail, condition_count).to(device, non_blocking=True).bool()
+        expanded_audio_mask = _repeat_batch_value(mask, condition_count).to(device, non_blocking=True).float()
         expanded_length = _repeat_batch_value(audio_length, condition_count)
         if torch.is_tensor(expanded_length):
             expanded_length = expanded_length.to(device, non_blocking=True)
@@ -502,9 +504,9 @@ def evaluate_sync_offsets(
             model=model,
             masked_spec=expanded_masked,
             frames=expanded_frames,
-            spk_emb=expanded_spk,
             audio_length=expanded_length,
             avail=expanded_avail,
+            audio_mask=expanded_audio_mask,
             chunk_size=forward_chunk_size,
         )
 
@@ -512,10 +514,8 @@ def evaluate_sync_offsets(
         for expanded_idx, meta in enumerate(expanded_meta):
             sample_idx = meta["sample_idx"]
             if sample_idx not in reference_cache:
-                path = resolve_audio_path(video_path[sample_idx], dataset_root)
-                reference_cache[sample_idx] = load_audio_ffmpeg(
-                    path, sr=sample_rate, fixlen_sec=CLIP_SEC
-                )
+                n_valid = int(audio_length[sample_idx]) if torch.is_tensor(audio_length) else int(audio_length[sample_idx])
+                reference_cache[sample_idx] = clean_audio[sample_idx].detach().cpu().numpy()[:n_valid]
             reference_audio = reference_cache[sample_idx]
 
             reconstructed_audio = librosa_mel2audio(
@@ -530,8 +530,8 @@ def evaluate_sync_offsets(
             predicted_audio = insert_reconstructed_gap(
                 original_audio=reference_audio,
                 reconstructed_audio=reconstructed_audio,
-                mask=mask[sample_idx],
-                hop_length=HOP_LENGTH,
+                mask=sample_mask[sample_idx],
+                hop_length=1,
             )
             valid_length = min(len(reference_audio), len(predicted_audio))
             pesq_score = calculate_pesq(

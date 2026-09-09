@@ -5,7 +5,8 @@ import numpy as np
 from glob import glob
 from torch.utils.data import Dataset, DataLoader, Subset
 
-from shared.masking import generate_ge_mask_bursty, generate_single_gap_mask
+from shared.masking import (generate_ge_trace_bursty, generate_single_gap_trace,
+                            trace_to_spec_mask)
 from evaluations.runtime_config import SEED
 
 # ----------------------------- DATASET -----------------------------
@@ -114,21 +115,24 @@ class AVDataset(Dataset):
 
             video_path = h5f.attrs.get(f"{video_key}/video_path", None)
             mel_spec = h5f[f"{video_key}/spec"][:].astype(np.float32)
+            audio_length = int(h5f.attrs.get(f"{video_key}/audio_len", mel_spec.shape[-1] * 160))
+            valid_t = min(mel_spec.shape[-1], (audio_length + 159) // 160)
 
             sample_id = f"{os.path.basename(self.chunk_files[chunk_idx])}:{video_key}"
             if self.mask_type == "single_gap":
                 if self.gap_ms is None:
                     raise ValueError("gap_ms is required when mask_type=single_gap")
-                mask = generate_single_gap_mask(
-                    mel_spec.shape, self.gap_ms, sample_id, seed=self.mask_seed
+                trace = generate_single_gap_trace(
+                    valid_t, self.gap_ms, sample_id, seed=self.mask_seed, hop_ms=10.0
                 )
+                mask = trace_to_spec_mask(trace, mel_spec.shape)
             elif self.mask_type != "gilbert":
                 raise ValueError(f"Unsupported mask_type: {self.mask_type}")
             elif self.online_loss_bounds is not None and self.mask_range == 'rand':
                 if self.set_seed is None:
                     # Training: draw a new loss rate and mask on every access.
                     loss_rate = np.random.uniform(*self.online_loss_bounds)
-                    mask = generate_ge_mask_bursty(mel_spec.shape, loss_rate=loss_rate)
+                    mask = trace_to_spec_mask(generate_ge_trace_bursty(valid_t, loss_rate), mel_spec.shape)
                 else:
                     # Validation: stable mask for this sample without changing global RNG state.
                     item_seed = self._stable_item_seed(sample_id, "val")
@@ -136,7 +140,7 @@ class AVDataset(Dataset):
                     try:
                         np.random.seed(item_seed)
                         loss_rate = np.random.uniform(*self.online_loss_bounds)
-                        mask = generate_ge_mask_bursty(mel_spec.shape, loss_rate=loss_rate)
+                        mask = trace_to_spec_mask(generate_ge_trace_bursty(valid_t, loss_rate), mel_spec.shape)
                     finally:
                         np.random.set_state(rng_state)
             elif self.set_seed is not None and self.mask_range != 'rand':
@@ -145,15 +149,17 @@ class AVDataset(Dataset):
                 rng_state = np.random.get_state()
                 try:
                     np.random.seed(item_seed)
-                    mask = generate_ge_mask_bursty(
-                        mel_spec.shape, loss_rate=float(self.mask_range) / 100
-                    )
+                    mask = trace_to_spec_mask(generate_ge_trace_bursty(valid_t, float(self.mask_range) / 100), mel_spec.shape)
                 finally:
                     np.random.set_state(rng_state)
             elif self.mask_range == 'rand':
                 mask = h5f[f"{video_key}/mask"][:]
             else:
                 mask = h5f[f"{video_key}/mask_{self.mask_range}"][:]
+
+            # Padding is invalid audio, never packet loss.
+            mask = np.asarray(mask, dtype=np.float32)
+            mask[:, valid_t:] = 1.0
 
             # audio normalization
             mel_spec = (mel_spec - self.mel_mean) / self.mel_std

@@ -25,11 +25,11 @@ from torch.utils.tensorboard import SummaryWriter
 from asteroid.losses.stoi import NegSTOILoss
 from asteroid.losses.pmsqe import SingleSrcPMSQE
 
-from shared.audio_processing import (mel_to_power_linear, read_gt_input, torch_mel2audio,
-                                     load_audio_ffmpeg)
+from shared.audio_processing import mel_to_power_linear, torch_mel2audio
 from evaluations.runtime_config import DATA_ROOT
 from shared.metrics import Vocoder, mel_to_audio_hifigan, torch_mel_to_audio, asr_transcribe_np
 from shared.metrics import calculate_batch_metrics, calculate_metrics
+from AV_PLC.audio_frontend import AudioFrontend, AudioFrontendConfig
 from AV_PLC.losses import (L1Loss, SpectralConvergenceLoss, CrossEntropyLoss, WhisperASRLoss,
                            MaskedMelReconstructionLoss, UnitPhaseLoss,
                            TemporalPhaseDifferenceLoss, FrequencyPhaseDifferenceLoss,
@@ -119,6 +119,9 @@ class Trainer:
         w_fused_mel: float = 1.0,
         phase_losses_only: bool = False,
         phase_only_training: bool = False,
+        mel_mean: float | None = None,
+        mel_std: float | None = None,
+        frontend_lookahead_ms: float = 7.5,
     ):
         self.model = model
         self.model_name = model_name
@@ -181,9 +184,25 @@ class Trainer:
 
         self.train_loader = train_loader
         self.val_loader = val_loader
+        inferred_stats = None
+        if mel_mean is None or mel_std is None:
+            source_loader = train_loader if train_loader is not None else val_loader
+            if source_loader is not None:
+                inferred_stats = self._get_dataset_stats(source_loader)
+        if mel_mean is None:
+            mel_mean = inferred_stats[0] if inferred_stats is not None else None
+        if mel_std is None:
+            mel_std = inferred_stats[1] if inferred_stats is not None else None
+        if mel_mean is None or mel_std is None:
+            raise ValueError("Trainer requires AV_PLC Mel statistics")
+        self.mel_mean, self.mel_std = float(mel_mean), float(mel_std)
+        self.frontend_lookahead_ms = float(frontend_lookahead_ms)
+        self.audio_frontend = AudioFrontend(
+            AudioFrontendConfig(lookahead_ms=self.frontend_lookahead_ms),
+            mel_mean=self.mel_mean, mel_std=self.mel_std,
+        )
         if self.phase_reconstruction and getattr(model, "phase_completion", None) is not None:
-            mel_mean, mel_std = self._get_dataset_stats(train_loader)
-            model.phase_completion.set_mel_stats(mel_mean, mel_std)
+            model.phase_completion.set_mel_stats(self.mel_mean, self.mel_std)
         self.learning_rate = learning_rate
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_root = checkpoint_dir
@@ -248,14 +267,14 @@ class Trainer:
 
         if self.sc_loss:
             self.synth_sc_weight = 0.05
-            self.sc_criterion = SpectralConvergenceLoss().to(self.device)
+            self.sc_criterion = SpectralConvergenceLoss(self.mel_mean, self.mel_std).to(self.device)
         else:
             self.synth_sc_weight = 0.0
             self.sc_criterion = None
 
         if self.ce_loss:
             self.synth_ce_weight = 0.005
-            self.ce_criterion = CrossEntropyLoss().to(self.device)
+            self.ce_criterion = CrossEntropyLoss(self.mel_mean, self.mel_std).to(self.device)
         else:
             self.synth_ce_weight = 0.0
             self.ce_criterion = None
@@ -271,7 +290,9 @@ class Trainer:
             self.stoi_criterion = None
 
         if self.asr_loss:
-            self.asr_criterion = WhisperASRLoss(model_size="tiny.en").to(self.device)
+            self.asr_criterion = WhisperASRLoss(
+                model_size="tiny.en", mel_mean=self.mel_mean, mel_std=self.mel_std
+            ).to(self.device)
         else:
             self.asr_criterion = None
 
@@ -295,7 +316,10 @@ class Trainer:
                 if self.magnitude_loss else None
             )
             self.waveform_criterion = (
-                WaveformReconstructionLoss().to(self.device) if self.waveform_loss else None
+                WaveformReconstructionLoss(
+                    sample_rate=self.sample_rate,
+                    lookahead_ms=self.frontend_lookahead_ms,
+                ).to(self.device) if self.waveform_loss else None
             )
         else:
             self.phase_unit_criterion = None
@@ -358,6 +382,30 @@ class Trainer:
             return [0.6, 0.15, 0.25]
     # --------------------------------------------------------------------------------------------
     def _move_batch_to_device(self, batch):
+        """Move the legacy model tensors while retaining waveform-domain auxiliaries.
+
+        New AV_PLC datasets append four items to every legacy tuple:
+          clean_audio, sample_mask, frame_valid, soft_keep.
+        Keeping the original core tuple order avoids breaking the existing trainer logic.
+        """
+        self._current_audio = None
+        self._current_sample_mask = None
+        self._current_frame_valid = None
+        self._current_soft_keep = None
+
+        if len(batch) >= 4:
+            maybe_valid = batch[-2]
+            if torch.is_tensor(maybe_valid) and maybe_valid.dtype == torch.bool:
+                core = batch[:-4]
+                self._current_audio = batch[-4]
+                self._current_sample_mask = batch[-3]
+                self._current_frame_valid = batch[-2]
+                self._current_soft_keep = batch[-1]
+            else:
+                core = batch
+        else:
+            core = batch
+
         visual_feats = spk_emb = masked_spec = spec = video_aligned_spec = None
         stft_magnitude = video_aligned_magnitude = None
         phase = video_aligned_phase = None
@@ -366,40 +414,45 @@ class Trainer:
 
         if self.mode == 'a':
             if self.phase_reconstruction:
-                if len(batch) != 8:
-                    raise ValueError(f"Expected 8 elements for parallel M/P audio mode, got {len(batch)}")
-                masked_spec, spec, stft_magnitude, phase, audio_length, text, mask, path = batch
+                if len(core) != 8:
+                    raise ValueError(f"Expected 8 core elements for phase audio mode, got {len(core)}")
+                masked_spec, spec, stft_magnitude, phase, audio_length, text, mask, path = core
             else:
-                masked_spec, spec, audio_length, text, mask, path = batch
+                if len(core) != 6:
+                    raise ValueError(f"Expected 6 core elements for audio mode, got {len(core)}")
+                masked_spec, spec, audio_length, text, mask, path = core
 
         elif self.mode == 'v':
             if self.phase_reconstruction:
-                if len(batch) != 12:
-                    raise ValueError(f"Expected 12 elements for parallel M/P video mode, got {len(batch)}")
+                if len(core) != 12:
+                    raise ValueError(f"Expected 12 core elements for phase video mode, got {len(core)}")
                 (visual_feats, spk_emb, spec, video_aligned_spec,
                  stft_magnitude, video_aligned_magnitude, phase, video_aligned_phase,
-                 audio_length, text, mask, path) = batch
-            elif len(batch) == 8:
-                (visual_feats, spk_emb, spec, video_aligned_spec, audio_length, text, mask, path,) = batch
-            elif len(batch) == 7:
-                visual_feats, spk_emb, spec, audio_length, text, mask, path = batch
+                 audio_length, text, mask, path) = core
+            elif len(core) == 8:
+                (visual_feats, spk_emb, spec, video_aligned_spec,
+                 audio_length, text, mask, path) = core
+            elif len(core) == 7:
+                visual_feats, spk_emb, spec, audio_length, text, mask, path = core
             else:
-                raise ValueError(f"Expected 7 or 8 elements for video mode, got {len(batch)}.")
+                raise ValueError(f"Expected 7 or 8 core elements for video mode, got {len(core)}")
 
         elif self.mode == 'av':
             if self.phase_reconstruction:
-                if len(batch) != 14:
-                    raise ValueError(f"Expected 14 elements for parallel M/P AV mode, got {len(batch)}")
+                if len(core) != 14:
+                    raise ValueError(f"Expected 14 core elements for phase AV mode, got {len(core)}")
                 (visual_feats, spk_emb, masked_spec, spec, video_aligned_spec,
                  stft_magnitude, video_aligned_magnitude, phase, video_aligned_phase,
-                 audio_length, text, mask, path, avail) = batch
-            elif len(batch) == 10:
+                 audio_length, text, mask, path, avail) = core
+            elif len(core) == 10:
                 (visual_feats, spk_emb, masked_spec, spec, video_aligned_spec,
-                 audio_length, text, mask, path, avail) = batch
-            elif len(batch) == 9:
-                visual_feats, spk_emb, masked_spec, spec, audio_length, text, mask, path, avail = batch
+                 audio_length, text, mask, path, avail) = core
+            elif len(core) == 9:
+                visual_feats, spk_emb, masked_spec, spec, audio_length, text, mask, path, avail = core
             else:
-                visual_feats, spk_emb, masked_spec, spec, audio_length, text, mask, path = batch
+                visual_feats, spk_emb, masked_spec, spec, audio_length, text, mask, path = core
+        else:
+            raise ValueError(f"Unsupported mode: {self.mode}")
 
         def _to_float(x):
             return x.float().to(self.device, non_blocking=non_blocking) if x is not None else None
@@ -415,8 +468,17 @@ class Trainer:
         video_aligned_phase = _to_float(video_aligned_phase)
         if audio_length is not None:
             audio_length = audio_length.long().to(self.device, non_blocking=non_blocking)
+        self._current_audio_length_for_loss = audio_length
         if avail is not None:
             avail = avail.to(self.device, non_blocking=non_blocking).bool()
+        if self._current_frame_valid is not None:
+            self._current_frame_valid = self._current_frame_valid.to(
+                self.device, non_blocking=non_blocking
+            ).bool()
+        if self._current_soft_keep is not None:
+            self._current_soft_keep = self._current_soft_keep.float().to(
+                self.device, non_blocking=non_blocking
+            )
 
         return (visual_feats, spk_emb, masked_spec, spec, video_aligned_spec,
                 stft_magnitude, video_aligned_magnitude, phase, video_aligned_phase,
@@ -429,15 +491,30 @@ class Trainer:
             rec, _ = self.model(masked_spec, audio_length)
             return None, rec, None, None
         elif self.mode == 'v':
-            synth, _ = self.model(visual_feats, spk_emb, audio_length)
+            synth, _ = self.model(visual_feats, None, audio_length)
             return None, None, synth, None
         elif self.mode == 'av':
             if audio_mask is not None:
                 audio_mask = audio_mask.to(device=masked_spec.device,
                     dtype=masked_spec.dtype, non_blocking=True,)
-            out = self.model(masked_spec, visual_feats, spk_emb, audio_length,
-                             avail=avail, audio_mask=audio_mask, phase=phase,
-                             stft_magnitude=stft_magnitude)
+            model_phase = phase
+            model_magnitude = stft_magnitude
+            # In waveform-domain PLC the observed complex STFT must come from the
+            # actually corrupted waveform.  Clean magnitude/phase remain targets
+            # for the phase losses and must never be exposed as observations.
+            if self.phase_reconstruction and self._current_audio is not None and self._current_sample_mask is not None:
+                observed_audio = (
+                    self._current_audio.to(masked_spec.device, dtype=torch.float32, non_blocking=True)
+                    * self._current_sample_mask.to(masked_spec.device, dtype=torch.float32, non_blocking=True)
+                )
+                with torch.amp.autocast('cuda', enabled=False):
+                    observed_stft = self.audio_frontend.stft(observed_audio.float())
+                model_magnitude = observed_stft.abs()
+                model_phase = torch.angle(observed_stft)
+
+            out = self.model(masked_spec, visual_feats, None, audio_length,
+                             avail=avail, audio_mask=audio_mask, phase=model_phase,
+                             stft_magnitude=model_magnitude)
             if isinstance(out, (tuple, list)):
                 if len(out) == 4:
                     return out[0], out[1], out[2], out[3]
@@ -455,7 +532,8 @@ class Trainer:
             phase_output["final_mag"].float() * phase_output["final_cos"].float(),
             phase_output["final_mag"].float() * phase_output["final_sin"].float(),
         )
-        return istft_overlap_add(z)
+        length = int(self._current_audio.shape[-1]) if self._current_audio is not None else 48000
+        return self.audio_frontend.istft(z, length=length)
 
     # --------------------------------------------------------------------------------------------
     def _compute_parallel_mp_loss(self, fused_spec, rec_spec, synth_spec, spec, avail,
@@ -499,7 +577,7 @@ class Trainer:
 
         # Three explicit L1 Mel heads: M_A, M_V, M_AV.
         if self.content_mel_losses and rec_spec is not None and a_on.any():
-            value = self.rec_criterion(rec_spec[a_on], spec[a_on])
+            value = self._valid_l1(rec_spec[a_on], spec[a_on], a_on)
             parts["audio_mel_l1"] = value
             loss = loss + self.w_audio_mel * value
         else:
@@ -507,7 +585,7 @@ class Trainer:
 
         if self.content_mel_losses and synth_spec is not None and v_on.any():
             v_target = video_aligned_spec if video_aligned_spec is not None else spec
-            value = self.rec_criterion(synth_spec[v_on], v_target[v_on])
+            value = self._valid_l1(synth_spec[v_on], v_target[v_on], v_on)
             parts["video_mel_l1"] = value
             loss = loss + self.w_video_mel * value
         else:
@@ -515,7 +593,7 @@ class Trainer:
 
         fused_mel = phase_output.get("fused_mel")
         if self.content_mel_losses and fused_mel is not None and both.any():
-            value = self.rec_criterion(fused_mel[both], spec[both])
+            value = self._valid_l1(fused_mel[both], spec[both], both)
             parts["fused_mel_l1"] = value
             loss = loss + self.w_fused_mel * value
         else:
@@ -582,6 +660,7 @@ class Trainer:
                     phase_output["final_cos"].float(),
                     phase_output["final_sin"].float(),
                     target_mag.float(), target_phase.float(),
+                    audio_lengths=self._current_audio_length_for_loss,
                 )
             parts["waveform_loss"] = value
             loss = loss + self.w_waveform * value
@@ -590,6 +669,18 @@ class Trainer:
 
         parts["loss"] = loss
         return loss, parts
+
+    def _valid_l1(self, pred, target, selector=None):
+        diff = (pred - target).abs()
+        frame_valid = self._current_frame_valid
+        if frame_valid is None:
+            return diff.mean()
+        if selector is not None:
+            frame_valid = frame_valid[selector]
+        n = min(diff.size(-1), frame_valid.size(-1))
+        diff = diff[..., :n]
+        m = frame_valid[..., :n].to(diff.dtype).unsqueeze(1)
+        return (diff * m).sum() / (m.sum() * diff.size(1)).clamp_min(1.0)
 
     # --------------------------------------------------------------------------------------------
     def _compute_loss(self, fused_spec, rec_spec, synth_spec, spec, avail,
@@ -624,7 +715,7 @@ class Trainer:
         # Legacy fused L1 is used only for models that do not expose the unified
         # completion output.  Counting it as well would duplicate Mel supervision.
         if completion_output is None and fused_spec is not None and both.any():
-            fused_loss = self.rec_criterion(fused_spec[both], spec[both])
+            fused_loss = self._valid_l1(fused_spec[both], spec[both], both)
             parts['fused_loss'] = fused_loss
             loss = loss + fused_loss
         else:
@@ -640,7 +731,7 @@ class Trainer:
             )
 
         if _supervise_enc and rec_spec is not None and a_on.any():
-            rec_loss = self.rec_criterion(rec_spec[a_on], spec[a_on])
+            rec_loss = self._valid_l1(rec_spec[a_on], spec[a_on], a_on)
             parts['rec_loss'] = rec_loss
             rec_w = 0.3 if fused_spec is not None else 1.0
             loss = loss + rec_w * rec_loss
@@ -653,7 +744,7 @@ class Trainer:
             target_all = video_aligned_spec if video_aligned_spec is not None else spec
             synth_target = target_all[v_on]
 
-            synth_loss = self.rec_criterion(synth_pred, synth_target)
+            synth_loss = self._valid_l1(synth_pred, synth_target, v_on)
             parts["synth_loss"] = synth_loss
             loss = loss + synth_w * synth_loss
 
@@ -761,10 +852,12 @@ class Trainer:
             if self.phase_complex_loss and self.phase_complex_criterion is not None:
                 with torch.amp.autocast('cuda', enabled=False):
                     pred_power = mel_to_power_linear(
-                        completion_output["predicted_mel"].float(), self.mel_pinv
+                        completion_output["predicted_mel"].float(), self.mel_pinv,
+                        mel_mean=self.mel_mean, mel_std=self.mel_std,
                     )
                     target_power = mel_to_power_linear(
-                        target_mel.float(), self.mel_pinv
+                        target_mel.float(), self.mel_pinv,
+                        mel_mean=self.mel_mean, mel_std=self.mel_std,
                     )
                     pred_mag = torch.sqrt(pred_power.clamp_min(1e-8))
                     target_mag = torch.sqrt(target_power.clamp_min(1e-8))
@@ -805,8 +898,8 @@ class Trainer:
                 p = head_output[idx].float()
                 r = spec[idx].float()
                 if self.pesq_loss and self.pmsqe is not None:
-                    pow_ref = mel_to_power_linear(r, self.mel_pinv).permute(0, 2, 1).contiguous()
-                    pow_est = mel_to_power_linear(p, self.mel_pinv).permute(0, 2, 1).contiguous()
+                    pow_ref = mel_to_power_linear(r, self.mel_pinv, mel_mean=self.mel_mean, mel_std=self.mel_std).permute(0, 2, 1).contiguous()
+                    pow_est = mel_to_power_linear(p, self.mel_pinv, mel_mean=self.mel_mean, mel_std=self.mel_std).permute(0, 2, 1).contiguous()
                     pmsqe_accum = pmsqe_accum + w * torch.mean(self.pmsqe(pow_est, pow_ref))
                 if self.asr_loss and self.asr_criterion is not None:
                     asr_accum = asr_accum + w * self.asr_criterion(r, p)
@@ -938,7 +1031,8 @@ class Trainer:
         specs_accum, res_accum = [], []
         phase_audio_accum = []
         mask_accum, path_accum = [], []
-        gt_audio_accum, gt_ref_text = [], []
+        audio_accum, sample_mask_accum, audio_len_accum, frame_valid_accum = [], [], [], []
+        gt_ref_text = []
         mel_mean, mel_std = self._get_dataset_stats(self.val_loader)
 
         for bidx, batch in enumerate(iterator):
@@ -976,6 +1070,11 @@ class Trainer:
                 path_accum.extend(path[:take])
                 gt_ref_text.extend(text[:take])
                 mask_accum.extend(mask[:take].detach().cpu())
+                if self._current_audio is not None:
+                    audio_accum.append(self._current_audio[:take].detach().cpu())
+                    sample_mask_accum.append(self._current_sample_mask[:take].detach().cpu())
+                    audio_len_accum.append(audio_length[:take].detach().cpu())
+                    frame_valid_accum.append(self._current_frame_valid[:take].detach().cpu())
 
                 n_collected += take
 
@@ -999,7 +1098,12 @@ class Trainer:
                                               mel_mean=mel_mean, mel_std=mel_std,
                                               reconstructed_audio_batch=(
                                                   torch.cat(phase_audio_accum, dim=0)
-                                                  if phase_audio_accum else None))
+                                                  if phase_audio_accum else None),
+                                              original_audio_batch=(torch.cat(audio_accum, dim=0) if audio_accum else None),
+                                              sample_mask_batch=(torch.cat(sample_mask_accum, dim=0) if sample_mask_accum else None),
+                                              audio_lengths=(torch.cat(audio_len_accum, dim=0) if audio_len_accum else None),
+                                              frame_valid_batch=(torch.cat(frame_valid_accum, dim=0) if frame_valid_accum else None),
+                                              normalize_wer_text=True)
 
         metrics['loss'] = float(np.mean(batch_losses)) if batch_losses else 0.0
 
@@ -1170,17 +1274,25 @@ class Trainer:
             rec_np = rec_spec[i].detach().cpu().numpy() if rec_spec is not None else None
             synth_np = synth_spec[i].detach().cpu().numpy() if synth_spec is not None else None
 
-            orig_audio, masked_audio = read_gt_input(path[i], mask[i])
-            masked_audio = masked_audio if masked_spec is not None else None
+            if self._current_audio is None:
+                raise ValueError("AV_PLC plotting requires HDF5 waveform data")
+            orig_audio = self._current_audio[i].detach().cpu().numpy().astype(np.float32)
+            valid_n = int(self._current_audio_length_for_loss[i]) if self._current_audio_length_for_loss is not None else len(orig_audio)
+            orig_audio = orig_audio[:valid_n]
+            if masked_spec is not None and self._current_sample_mask is not None:
+                sm = self._current_sample_mask[i].detach().cpu().numpy().astype(np.float32)[:valid_n]
+                masked_audio = orig_audio * sm
+            else:
+                masked_audio = None
 
             if self.vocoder is None:
-                fused_audio = torch_mel_to_audio(fused_spec[i].cpu()).cpu().numpy() if fused_spec is not None else None
-                rec_audio = torch_mel_to_audio(rec_spec[i].cpu()).cpu().numpy() if rec_spec is not None else None
-                synth_audio = torch_mel_to_audio(synth_spec[i].cpu()).cpu().numpy() if synth_spec is not None else None
+                fused_audio = torch_mel_to_audio(fused_spec[i].cpu(), self.mel_mean, self.mel_std).cpu().numpy() if fused_spec is not None else None
+                rec_audio = torch_mel_to_audio(rec_spec[i].cpu(), self.mel_mean, self.mel_std).cpu().numpy() if rec_spec is not None else None
+                synth_audio = torch_mel_to_audio(synth_spec[i].cpu(), self.mel_mean, self.mel_std).cpu().numpy() if synth_spec is not None else None
             else:
-                fused_audio = mel_to_audio_hifigan(fused_spec[i].cpu(), self.vocoder).cpu().numpy() if fused_spec is not None else None
-                rec_audio = mel_to_audio_hifigan(rec_spec[i], self.vocoder).cpu().numpy() if rec_spec is not None else None
-                synth_audio = mel_to_audio_hifigan(synth_spec[i], self.vocoder).cpu().numpy() if synth_spec is not None else None
+                fused_audio = mel_to_audio_hifigan(fused_spec[i].cpu(), self.vocoder, self.mel_mean, self.mel_std).cpu().numpy() if fused_spec is not None else None
+                rec_audio = mel_to_audio_hifigan(rec_spec[i], self.vocoder, self.mel_mean, self.mel_std).cpu().numpy() if rec_spec is not None else None
+                synth_audio = mel_to_audio_hifigan(synth_spec[i], self.vocoder, self.mel_mean, self.mel_std).cpu().numpy() if synth_spec is not None else None
 
             row = i * 2
             ax_spec_row = axes[row]
@@ -1457,7 +1569,9 @@ class Trainer:
         dataset = test_loader.dataset
         while hasattr(dataset, "dataset"):
             dataset = dataset.dataset
-        return float(getattr(dataset, "mel_mean", -56.775)), float(getattr(dataset, "mel_std", 19.707))
+        if not hasattr(dataset, "mel_mean") or not hasattr(dataset, "mel_std"):
+            raise ValueError("Dataset does not expose AV_PLC Mel statistics")
+        return float(dataset.mel_mean), float(dataset.mel_std)
 
 
     @staticmethod
@@ -1496,11 +1610,20 @@ class Trainer:
         return clean * mask_np + predicted * (1.0 - mask_np)
 
     @staticmethod
-    def _insert_reconstructed_gap(original_audio, reconstructed_audio, mask, hop_length=160):
+    def _insert_reconstructed_gap(original_audio, reconstructed_audio, mask=None,
+                                  sample_mask=None, hop_length=160):
         original_audio = np.asarray(original_audio, dtype=np.float32).squeeze()
         reconstructed_audio = np.asarray(reconstructed_audio, dtype=np.float32).squeeze()
-        time_keep = mask[0].detach().cpu().numpy().astype(np.float32)
-        waveform_mask = np.repeat(time_keep, hop_length)
+        if sample_mask is not None:
+            waveform_mask = np.asarray(
+                sample_mask.detach().cpu() if torch.is_tensor(sample_mask) else sample_mask,
+                dtype=np.float32,
+            ).squeeze()
+        elif mask is not None:
+            time_keep = mask[0].detach().cpu().numpy().astype(np.float32)
+            waveform_mask = np.repeat(time_keep, hop_length)
+        else:
+            return reconstructed_audio
         n = min(len(original_audio), len(reconstructed_audio), len(waveform_mask))
         return (original_audio[:n] * waveform_mask[:n] +
                 reconstructed_audio[:n] * (1.0 - waveform_mask[:n]))
@@ -1567,6 +1690,7 @@ class Trainer:
         model_chunks, masked_chunks = [], []
         specs_accum, head_accum, masked_accum, masks_accum = [], [], [], []
         phase_audio_accum = []
+        audio_accum, sample_mask_accum, audio_len_accum, frame_valid_accum = [], [], [], []
         texts_accum, paths_accum = [], []
         sample_id, chunk_batches = 0, 20
         head_name = "rec" if self.mode == "a" else "synth" if self.mode == "v" else "fused"
@@ -1620,6 +1744,11 @@ class Trainer:
                         mask.index_select(0, idx_mask),
                         selected_paths, sample_id, timestamp, mel_mean, mel_std,
                         phase_output=selected_phase_output,
+                        original_audio_batch=(self._current_audio.index_select(0, idx_spec.cpu())
+                                              if self._current_audio is not None else None),
+                        sample_mask_batch=(self._current_sample_mask.index_select(0, idx_spec.cpu())
+                                           if self._current_sample_mask is not None else None),
+                        audio_lengths=audio_length.index_select(0, idx_spec.to(audio_length.device)).detach().cpu(),
                         audio_dir=audio_dir, spec_dir=spec_dir, plot_dir=plot_dir)
                     saved_sample_paths.update(
                         self._relative_dataset_path(p) for p in selected_paths)
@@ -1632,6 +1761,11 @@ class Trainer:
                 phase_audio_accum.append(phase_audio)
             masked_accum.append(masked_spec.detach().cpu())
             masks_accum.append(mask.detach().cpu())
+            if self._current_audio is not None:
+                audio_accum.append(self._current_audio.detach().cpu())
+                sample_mask_accum.append(self._current_sample_mask.detach().cpu())
+                audio_len_accum.append(audio_length.detach().cpu())
+                frame_valid_accum.append(self._current_frame_valid.detach().cpu())
             texts_accum.append(text)
             paths_accum.extend(list(path))
 
@@ -1646,7 +1780,12 @@ class Trainer:
                 common = dict(
                     original_batch=originals, texts=texts, path=list(paths_accum), mask=masks,
                     hifigan_vocoder=self.vocoder, tokenizer=None, max_samples=n_samples,
-                    sample_rate=self.sample_rate, mel_mean=mel_mean, mel_std=mel_std)
+                    sample_rate=self.sample_rate, mel_mean=mel_mean, mel_std=mel_std,
+                    original_audio_batch=(torch.cat(audio_accum, dim=0) if audio_accum else None),
+                    sample_mask_batch=(torch.cat(sample_mask_accum, dim=0) if sample_mask_accum else None),
+                    audio_lengths=(torch.cat(audio_len_accum, dim=0) if audio_len_accum else None),
+                    frame_valid_batch=(torch.cat(frame_valid_accum, dim=0) if frame_valid_accum else None),
+                    normalize_wer_text=True)
                 model_chunks.append((calculate_batch_metrics(
                     reconstructed_batch=heads, masked_input=False,
                     reconstructed_audio_batch=(torch.cat(phase_audio_accum, dim=0)
@@ -1656,6 +1795,7 @@ class Trainer:
                     reconstructed_batch=masked_inputs, masked_input=True, **common), n_samples))
                 specs_accum.clear(); head_accum.clear(); masked_accum.clear()
                 phase_audio_accum.clear()
+                audio_accum.clear(); sample_mask_accum.clear(); audio_len_accum.clear(); frame_valid_accum.clear()
                 masks_accum.clear(); texts_accum.clear(); paths_accum.clear()
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
@@ -1844,6 +1984,11 @@ class Trainer:
                 sample_rate=self.sample_rate,
                 mel_mean=mel_mean,
                 mel_std=mel_std,
+                original_audio_batch=(self._current_audio.detach().cpu() if self._current_audio is not None else None),
+                sample_mask_batch=(self._current_sample_mask.detach().cpu() if self._current_sample_mask is not None else None),
+                audio_lengths=audio_length.detach().cpu() if audio_length is not None else None,
+                frame_valid_batch=(self._current_frame_valid.detach().cpu() if self._current_frame_valid is not None else None),
+                normalize_wer_text=True,
             )
 
             if include_masked_input:
@@ -1943,7 +2088,8 @@ class Trainer:
 
     def _write_outputs(self, spec, masked_spec, fused_spec, rec_spec, synth_spec,
                        mask, path, sample_id, timestamp, mel_mean, mel_std,
-                       phase_output=None, plot_dir=None, spec_dir=None, audio_dir=None):
+                       phase_output=None, original_audio_batch=None, sample_mask_batch=None,
+                       audio_lengths=None, plot_dir=None, spec_dir=None, audio_dir=None):
         def _to_float(x):
             if x is None:
                 return None
@@ -1985,9 +2131,15 @@ class Trainer:
                     synth_spec[i:i + 1] if synth_spec is not None else None,
                     mask[i:i + 1], path[i:i + 1], f"sample_{sid}", sample_plot_dir)
 
-            orig_raw, masked_raw = read_gt_input(video_path, mask[i])
-            orig_f32 = _to_float(orig_raw)
-            masked_f32 = _to_float(masked_raw if masked_spec is not None else None)
+            if original_audio_batch is None:
+                raise ValueError("AV_PLC output writing requires the HDF5 original_audio_batch")
+            orig_raw = original_audio_batch[i]
+            orig_raw = orig_raw.detach().cpu().numpy() if torch.is_tensor(orig_raw) else np.asarray(orig_raw)
+            sm = sample_mask_batch[i] if sample_mask_batch is not None else None
+            sm_np = sm.detach().cpu().numpy() if torch.is_tensor(sm) else (np.asarray(sm) if sm is not None else None)
+            valid_n = int(audio_lengths[i]) if audio_lengths is not None else len(orig_raw)
+            orig_f32 = _to_float(orig_raw[:valid_n])
+            masked_f32 = _to_float(orig_f32 * sm_np[:valid_n] if masked_spec is not None and sm_np is not None else None)
             if phase_output is not None and phase_output.get("final_cos") is not None:
                 sample_out = {
                     k: (v[i:i + 1] if torch.is_tensor(v) and v.size(0) == spec.size(0) else v)
@@ -2001,9 +2153,9 @@ class Trainer:
                 fused_raw = _head_audio(fused_spec, i)
             rec_raw = _head_audio(rec_spec, i)
             synth_raw = _head_audio(synth_spec, i)
-            fused_f32 = (self._insert_reconstructed_gap(orig_f32, fused_raw, mask[i])
+            fused_f32 = (self._insert_reconstructed_gap(orig_f32, fused_raw, mask[i], sample_mask=sm_np)
                          if fused_raw is not None else None)
-            rec_f32 = (self._insert_reconstructed_gap(orig_f32, rec_raw, mask[i])
+            rec_f32 = (self._insert_reconstructed_gap(orig_f32, rec_raw, mask[i], sample_mask=sm_np)
                        if rec_raw is not None else None)
             synth_f32 = (self._insert_reconstructed_gap(orig_f32, synth_raw, mask[i])
                          if synth_raw is not None else None)

@@ -1,0 +1,35 @@
+Changed/new files relative to models/
+
+MODIFIED AV_LSTM/av_l_dataset.py
+MODIFIED AV_PLC/ablation_av_sync_shift.py
+MODIFIED AV_PLC/ablation_gap_sweep.py
+MODIFIED AV_PLC/ablation_video_reduction.py
+NEW      AV_PLC/audio_frontend.py
+MODIFIED AV_PLC/av_dataloader.py
+NEW      AV_PLC/batch_utils.py
+NEW      AV_PLC/build_reference_face.py
+MODIFIED AV_PLC/check_weights.py
+NEW      AV_PLC/compute_audio_stats.py
+NEW      AV_PLC/diagnostic_audio.py
+MODIFIED AV_PLC/grid_phase_common_rotation_final_diagnostic.py
+MODIFIED AV_PLC/grid_phase_oracle_diagnostic.py
+MODIFIED AV_PLC/grid_phase_oracle_followup.py
+NEW      AV_PLC/integration_smoke_test.py
+MODIFIED AV_PLC/losses.py
+NEW      AV_PLC/mel_stats/README.txt
+MODIFIED AV_PLC/multimodal_decoder.py
+MODIFIED AV_PLC/resnet_.py
+MODIFIED AV_PLC/runner.py
+MODIFIED AV_PLC/trainer.py
+MODIFIED AV_PLC/video_encoder.py
+NEW      AV_PLC/video_preprocessing.py
+NEW      AV_PLC/waveform_masking.py
+NEW      AV_PLC_TEST_REPORT.md
+NEW      AV_PLC_UPDATE_GUIDE.md
+MODIFIED AV_S2S/av_l_dataset.py
+MODIFIED AV_Transformer/av_l_dataset.py
+MODIFIED dataset/features/save_features.py
+MODIFIED dataset/features/update_features.py
+MODIFIED shared/masking.py
+MODIFIED shared/metrics.py
+NEW      AV_PLC_CHANGED_FILES.txt

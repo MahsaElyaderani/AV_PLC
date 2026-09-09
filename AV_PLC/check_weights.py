@@ -38,18 +38,20 @@ h2 = model.fusion.audio_from_video.register_forward_hook(save_output("a_update")
 
 # --- run one real batch through the model ---
 from AV_PLC.av_dataloader import AVDataloader
+from AV_PLC.batch_utils import split_waveform_aux
 av_dataloader = AVDataloader(mode="av",
                              dataset_name="grid",
                              batch_size=1, num_workers=0,
                              dropout_modality=False, video_aug=False,)
 val_loader = av_dataloader.val_dataloader()
 batch = next(iter(val_loader))
-visual_feats, spk_emb, masked_spec, spec, video_aligned_spec, audio_length, text, mask, path, avail = batch
+core, _clean_audio, _sample_mask, _frame_valid, _soft_keep = split_waveform_aux(batch)
+visual_feats, spk_emb, masked_spec, spec, video_aligned_spec, audio_length, text, mask, path, avail = core
 with torch.no_grad():
     fused_mel, amel, vmel = model(
         dec_input=masked_spec,
         enc_input=visual_feats,
-        spk_emb=spk_emb,
+        spk_emb=None,
         audio_length=audio_length,
         audio_mask=mask,
         avail=avail,
@@ -93,7 +95,7 @@ with torch.no_grad():
     fused_mel, amel, vmel = model(
         dec_input=masked_spec,
         enc_input=visual_feats,
-        spk_emb=spk_emb,
+        spk_emb=None,
         audio_length=audio_length,
         audio_mask=mask,
         avail=avail,

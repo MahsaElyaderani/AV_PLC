@@ -11,6 +11,7 @@ import multiprocessing
 from pathlib import Path
 import traceback
 import subprocess, shlex
+import hashlib
 
 import torch
 import torchaudio
@@ -30,8 +31,12 @@ try:
 except Exception:
     HAS_FAIRSEQ = False
 
-from shared.text_processing import TextTokenizer
-from shared.masking import GilbertElliottModel
+from shared.text_processing import TextTokenizer, PhonemeTokenizer
+from shared.masking import (
+    GilbertElliottModel, generate_ge_trace_bursty, trace_to_spec_mask,
+    packet_count_from_audio_len,
+)
+from AV_PLC.video_preprocessing import ReferenceFaceAligner
 
 # -------------------- constants --------------------
 LANDMARK_DIM = 478
@@ -41,6 +46,7 @@ DURATION_SEC = 3.0
 T_TARGET = int(round(FPS * DURATION_SEC))
 AUDIO_LEN = int(round(SR * DURATION_SEC))
 lip_indices = sorted(set(i for connection in FACEMESH_LIPS for i in connection))
+AUDIO_STORAGE_DTYPE = os.environ.get("AVPLC_AUDIO_STORAGE_DTYPE", "float32").strip().lower()
 
 # -------------------- init per-worker --------------------
 def init_worker():
@@ -83,8 +89,21 @@ def init_worker():
         min_tracking_confidence=0.5
     )
 
-    global ctc_tokenizer
+    global ctc_tokenizer, phoneme_tokenizer
     ctc_tokenizer = TextTokenizer()
+    phoneme_tokenizer = PhonemeTokenizer()
+
+    global avplc_face_aligner
+    reference_path = os.environ.get(
+        "AVPLC_REFERENCE_FACE",
+        str(Path(__file__).resolve().parents[2] / "AV_PLC" / "reference_face.npy"),
+    )
+    if not os.path.isfile(reference_path):
+        raise FileNotFoundError(
+            f"AV_PLC reference face not found: {reference_path}. "
+            "Build it first with python -m AV_PLC.build_reference_face ..."
+        )
+    avplc_face_aligner = ReferenceFaceAligner.from_npy(reference_path)
 
     ######### ---- AV-HuBERT load ---- ########
     global avhubert_model, task
@@ -125,26 +144,34 @@ def read_audio_ffmpeg(path: str, target_sr: int, max_sec: float):
 def stream_decode_opencv(
         path: str,
         face_mesh,
-        frame_size=(112, 112),#(96, 96),
+        aligner,
+        frame_size=(96, 96),
+        legacy_avhubert_size=(112, 112),
         target_fps: float = FPS,
         max_sec: float = DURATION_SEC,
         lip_indices=lip_indices
 ):
-    """
-    Stream video frames via OpenCV and crop mouth ROI per frame with MediaPipe.
+    """Decode one clip and build both visual paths.
+
     Returns:
-        frames_roi: np.uint8  [T, H, W, 1]  (grayscale with channel dim)
-        landmarks:  np.float32[T, L, 2]
+        aligned_frames:   [T,96,96,1] AV_PLC reference-face-aligned mouth ROI
+        lip_landmarks:    [T,L,2] legacy key used by AV_LSTM/AV_S2S
+        full_landmarks:   [T,478,2] MediaPipe full-face coordinates
+        video_len:        number of decoded 25-Hz frames before zero padding
+        avhubert_frames:  [T,112,112,1] legacy dynamic ROI used ONLY to keep
+                           stored AV-HuBERT visual_features unchanged
     """
     T = int(round(target_fps * max_sec))
-    frames_roi = np.zeros((T, frame_size[0], frame_size[1], 1), dtype=np.uint8)
-    landmarks = np.zeros((T, len(lip_indices), 2), dtype=np.float32)
+    raw_frames = []
+    legacy_frames = np.zeros((T, legacy_avhubert_size[0], legacy_avhubert_size[1], 1), dtype=np.uint8)
+    full_landmarks = np.zeros((T, LANDMARK_DIM, 2), dtype=np.float32)
+    lip_landmarks = np.zeros((T, len(lip_indices), 2), dtype=np.float32)
+    detected = np.zeros(T, dtype=bool)
 
     cap = cv2.VideoCapture(path)
     src_fps = cap.get(cv2.CAP_PROP_FPS)
     if not src_fps or src_fps <= 1e-3:
         src_fps = target_fps
-
     ratio = max(1, int(round(src_fps / target_fps)))
     t_written, i = 0, 0
 
@@ -152,54 +179,51 @@ def stream_decode_opencv(
         ok, frame_bgr = cap.read()
         if not ok:
             break
-
         if (i % ratio) != 0:
             i += 1
             continue
         i += 1
 
-        frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)  # RGB uint8
-        res = face_mesh.process(frame)
-        lm_full = np.zeros((LANDMARK_DIM, 2), dtype=np.float32)
+        frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        raw_frames.append(frame)
         h, w = frame.shape[:2]
+        result = face_mesh.process(frame)
 
-        if res.multi_face_landmarks:
-            face = res.multi_face_landmarks[0]
-            lm_full = np.array([[lm.x * w, lm.y * h] for lm in face.landmark], dtype=np.float32)
-            lips = lm_full[lip_indices]
+        if result.multi_face_landmarks:
+            face = result.multi_face_landmarks[0]
+            lm = np.array([[p.x * w, p.y * h] for p in face.landmark], dtype=np.float32)
+            n = min(LANDMARK_DIM, lm.shape[0])
+            full_landmarks[t_written, :n] = lm[:n]
+            lip_landmarks[t_written] = full_landmarks[t_written, lip_indices]
+            detected[t_written] = True
+
+            # Preserve the exact legacy dynamic mouth crop for AV-HuBERT features.
+            lips = lip_landmarks[t_written]
             x1, y1 = np.min(lips, axis=0)
             x2, y2 = np.max(lips, axis=0)
             pad_x = (x2 - x1) * 0.5
             pad_y = (y2 - y1) * 0.5
-            x1 = int(max(0, x1 - pad_x))
-            y1 = int(max(0, y1 - pad_y))
-            x2 = int(min(w, x2 + pad_x))
-            y2 = int(min(h, y2 + pad_y))
+            x1 = int(max(0, x1 - pad_x)); y1 = int(max(0, y1 - pad_y))
+            x2 = int(min(w, x2 + pad_x)); y2 = int(min(h, y2 + pad_y))
             crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                gray = np.zeros(frame_size, dtype=np.uint8)
-            else:
+            if crop.size:
                 gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-                gray = cv2.resize(gray, frame_size)
-        else:
-            gray = np.zeros(frame_size, dtype=np.uint8)
-
-        frames_roi[t_written, :, :, 0] = gray
-        landmarks[t_written] = lm_full[lip_indices]
+                legacy_frames[t_written, :, :, 0] = cv2.resize(gray, legacy_avhubert_size)
         t_written += 1
 
     cap.release()
+    if detected[:t_written].sum() < 2:
+        return None, None, None, 0, None
 
-    # a frame is valid if its landmark row isn't all zeros
-    valid_mask = np.any(np.abs(landmarks) > 1e-6, axis=(1, 2))  # [t_written]
-
-    if valid_mask.sum() < 2:
-        return None, None
-
-    if t_written < T:
-        frames_roi[t_written:] = 0
-
-    return frames_roi, landmarks
+    actual_rgb = np.stack(raw_frames[:t_written], axis=0)
+    aligned_actual = aligner.align_sequence(
+        actual_rgb,
+        full_landmarks[:t_written],
+        detected[:t_written],
+    )
+    aligned_frames = np.zeros((T, frame_size[0], frame_size[1], 1), dtype=np.uint8)
+    aligned_frames[:t_written] = aligned_actual
+    return aligned_frames, lip_landmarks, full_landmarks, t_written, legacy_frames
 
 
 def embed_from_window_05s(
@@ -273,12 +297,10 @@ def extract_features(video_path):
     results = []
     try:
         # Stream decode (never load full clip)
-        frames_roi, landmarks = stream_decode_opencv(
-            video_path, face_mesh,
-            frame_size=(112, 112), #(96, 96),
-            target_fps=FPS,
-            max_sec=DURATION_SEC,
-            lip_indices=lip_indices
+        frames_roi, landmarks, full_landmarks, video_len, avhubert_frames = stream_decode_opencv(
+            video_path, face_mesh, avplc_face_aligner,
+            frame_size=(96, 96), legacy_avhubert_size=(112, 112),
+            target_fps=FPS, max_sec=DURATION_SEC, lip_indices=lip_indices
         )
         audio, valid_len = read_audio_ffmpeg(video_path, target_sr=SR, max_sec=DURATION_SEC)
 
@@ -288,23 +310,33 @@ def extract_features(video_path):
         # Spectrogram (np.float32)
         spec = extract_spectral(audio)
         spec_f, spec_t = spec.shape
-        valid_t = min(spec_t, int(round(valid_len // 160)))  # 10ms hop
+        valid_t = min(spec_t, (int(valid_len) + 159) // 160)  # valid 10-ms packets
 
-        if 'grid' in video_path:
-            # Alignment text for GRID-style dataset
+        transcript = ""
+        if 'grid' in video_path.lower():
+            # Parse the GRID alignment once so the character and phoneme
+            # targets correspond to the same valid utterance.
             align_path = Path(video_path).parent / "align" / (Path(video_path).stem + ".align")
-            encoded_text = ctc_tokenizer.load_alignment(str(align_path))
-        # elif 'lrs2' in video_path:
-        #     txt_path = os.path.splitext(video_path)[0] + ".txt"
-        #     transcript = ctc_tokenizer.read_transcript(txt_path)
-        #     encoded_text = ctc_tokenizer.encode(transcript)
-        elif 'lrs2' in video_path:
+            words = []
+            with open(align_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 3 and parts[2].lower() != "sil":
+                        words.append(parts[2])
+            transcript = " ".join(words)
+        elif 'lrs2' in video_path.lower():
             txt_path = os.path.splitext(video_path)[0] + ".txt"
-            valid_sec = valid_len / SR  # valid_len already computed above
-            transcript = ctc_tokenizer.read_transcript_lrs2(
-                txt_path, valid_sec=valid_sec, max_sec=DURATION_SEC
+            valid_sec = min(DURATION_SEC, valid_len / SR)
+            transcript, _ = ctc_tokenizer.read_transcripts_for_chunk(
+                txt_path, start_sec=0.0, max_sec=valid_sec
             )
-            encoded_text = ctc_tokenizer.encode(transcript)
+        else:
+            # VoxCeleb2 has no authoritative transcript in this extractor.
+            # Store empty targets rather than inventing WER references.
+            transcript = ""
+
+        encoded_text, _ = ctc_tokenizer.encode(transcript, max_length=128)
+        phone_indices, _, _ = phoneme_tokenizer.encode(transcript, max_length=128)
 
         # Speaker embedding (from this clip's audio; keep it simple here)
         #spkr_embed = voice_encoder.embed_utterance(audio.detach().cpu().numpy().astype(np.float32))
@@ -317,21 +349,33 @@ def extract_features(video_path):
             try:
                 avhubert_vis = extract_visual_feature(avhubert_model,
                                                              task,
-                                                             frames_roi[..., 0])
+                                                             avhubert_frames[..., 0])
             except Exception as e:
                 logging.warning(f"AV-HuBERT features failed for {video_path}: {e}")
                 avhubert_vis = None
 
         is_trainval = ('/train/' in video_path.lower()) or ('/val/' in video_path.lower())
 
+        audio_np = audio.detach().cpu().numpy().astype(np.float32)
+        if AUDIO_STORAGE_DTYPE == "int16":
+            audio_store = np.clip(np.rint(audio_np * 32768.0), -32768, 32767).astype(np.int16)
+        elif AUDIO_STORAGE_DTYPE == "float32":
+            audio_store = audio_np
+        else:
+            raise ValueError("AVPLC_AUDIO_STORAGE_DTYPE must be 'float32' or 'int16'")
+
         base = {
             'video_path': video_path,
             'audio_len': valid_len,
+            'video_len': video_len,
+            'audio': audio_store,
             'text': encoded_text,
-            'frames': frames_roi.astype(np.uint8),  # [T,H,W,1]
-            'landmarks': landmarks.astype(np.float32),  # [T,L,2]
-            'spec': spec,  # [80, Tspec] float32
-            'spkr_embd': spkr_embed,  # [256] float32
+            'phone_indices': np.asarray(phone_indices, dtype=np.int32),
+            'frames': frames_roi.astype(np.uint8),  # new aligned 96x96 AV_PLC frames
+            'landmarks': landmarks.astype(np.float32),  # keep legacy lip-only key
+            'full_landmarks': full_landmarks.astype(np.float32),
+            'spec': spec,  # keep legacy target for comparison projects
+            'spkr_embd': spkr_embed,
         }
         if avhubert_vis is not None:
             base['visual_features'] = avhubert_vis  # [T', C] float32
@@ -444,14 +488,18 @@ def write_h5(output_file, results, start_index, mode):
         for idx, result in enumerate(results):
             video_idx = start_index + idx
             video_key = f"video_{video_idx}"
+            h5f.create_dataset(f"{video_key}/audio", data=result["audio"], compression="gzip")
             h5f.create_dataset(f"{video_key}/frames", data=result["frames"], compression="gzip")
             h5f.create_dataset(f"{video_key}/landmarks", data=result["landmarks"], compression="gzip")
+            h5f.create_dataset(f"{video_key}/full_landmarks", data=result["full_landmarks"], compression="gzip")
             h5f.create_dataset(f"{video_key}/spec", data=result["spec"], compression="gzip")
             h5f.create_dataset(f"{video_key}/text", data=result["text"], compression="gzip")
+            h5f.create_dataset(f"{video_key}/phone_indices", data=result["phone_indices"], compression="gzip")
             h5f.create_dataset(f"{video_key}/spkr_embd", data=result["spkr_embd"], compression="gzip")
             h5f.create_dataset(f"{video_key}/mask", data=result["mask"], compression="gzip")
             h5f.attrs[f"{video_key}/video_path"] = result["video_path"]
             h5f.attrs[f"{video_key}/audio_len"] = result["audio_len"]
+            h5f.attrs[f"{video_key}/video_len"] = result["video_len"]
 
             #### masks
             for pct in (20, 30, 40, 50, 60, 70, 80):
@@ -477,7 +525,7 @@ def update_h5(chunk_file):
         for video_key in tqdm(video_keys, desc=f"{os.path.basename(chunk_file)}"):
             video_path = h5f.attrs.get(f"{video_key}/video_path", None)
             if video_path is not None:
-                audio = read_audio_ffmpeg(video_path, target_sr=SR, max_sec=DURATION_SEC)
+                audio, _ = read_audio_ffmpeg(video_path, target_sr=SR, max_sec=DURATION_SEC)
                 if audio is None or audio.numel() == 0:
                     print(f"Warning: No usable audio for {video_key}")
                     continue
@@ -497,7 +545,7 @@ def update_h5_parallel(base_path, chunk_pattern="_chunk*.h5"):
         pool.map(update_h5, chunk_files)
         #pool.map(update_mel_h5, chunk_files)
 
-def load_video_list_from_txt(split_file, root_path):
+def load_video_list_from_txt(split_file, root_path, extension=".mp4"):
     rel_paths = []
     with open(split_file, "r") as f:
         for line in f:
@@ -508,29 +556,17 @@ def load_video_list_from_txt(split_file, root_path):
             first_token = line.split()[0]
             rel_paths.append(first_token)
 
-    return [os.path.join(root_path, rel + ".mp4") for rel in rel_paths]
+    return [os.path.join(root_path, rel + extension) for rel in rel_paths]
 
 def update_h5_test_masks(base_path, chunk_pattern="_chunk*.h5", seed=42,
                          loss_rates=(1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 99),
                          overwrite=False):
-    """
-    Pre-compute and store deterministic test masks for every loss rate in all
-    HDF5 chunk files found under base_path.
+    """Optionally cache deterministic test masks using the CURRENT dataset logic.
 
-    Replicates the exact per-sample seeding used by AVDataset at test time:
-        item_seed = (seed + global_idx) % 2**32
-        np.random.seed(item_seed)
-        mask = generate_ge_mask(spec_shape, loss_rate=rate / 100.0)
-
-    After running this, set set_seed=None in test_dataloader (or remove the
-    set_seed branch in AVDataset) so the loader reads masks from HDF5 directly.
-
-    Args:
-        base_path     : directory prefix, e.g. '/home/.../datasets/grid/grid_test_features'
-        chunk_pattern : glob suffix,      e.g. '_chunk*.h5'
-        seed          : must match the seed passed to test_dataloader() (default 42)
-        loss_rates    : iterable of integer percentages to pre-compute
-        overwrite     : if False, skip datasets that already exist (safe to re-run)
+    Active runners generate masks online, so this cache is not required.  When
+    used for legacy/debug workflows, it must still obey ``audio_len`` and use
+    the same stable sample-specific seed as all four dataset implementations.
+    Padding frames are always keep=1.
     """
     import re
 
@@ -542,52 +578,70 @@ def update_h5_test_masks(base_path, chunk_pattern="_chunk*.h5", seed=42,
     if not chunk_files:
         raise FileNotFoundError(f"No HDF5 files found matching: {base_path}{chunk_pattern}")
 
-    logging.info(f"Found {len(chunk_files)} chunk file(s). Generating masks for rates: {list(loss_rates)}")
-
-    global_idx = 0  # must match AVDataset's __getitem__ idx (0-based, chunk-ordered, no shuffle)
-
     for chunk_file in chunk_files:
-        logging.info(f"Processing: {chunk_file}  (global_idx starts at {global_idx})")
         with h5py.File(chunk_file, 'r+') as h5f:
-            # list(h5f.keys()) preserves insertion order — same as AVDataset.index_map
-            video_keys = list(h5f.keys())
-
-            for video_key in tqdm(video_keys, desc=os.path.basename(chunk_file)):
-                spec_shape = h5f[f"{video_key}/spec"].shape  # (F, T) — no data read, just metadata
+            for video_key in tqdm(list(h5f.keys()), desc=os.path.basename(chunk_file)):
+                spec_shape = h5f[f"{video_key}/spec"].shape
+                audio_len = int(h5f.attrs.get(f"{video_key}/audio_len", spec_shape[1] * 160))
+                valid_t = min(spec_shape[1], packet_count_from_audio_len(audio_len, 160))
+                sample_id = f"{os.path.basename(chunk_file)}:{video_key}"
 
                 for rate in loss_rates:
                     ds_name = f"{video_key}/mask_{rate}"
-
                     if not overwrite and ds_name in h5f:
-                        continue  # already stored; safe to skip
-
-                    # ---- replicate AVDataset seeding exactly ----
-                    item_seed = (seed + global_idx) % (2 ** 32)
-                    np.random.seed(item_seed)
-                    mask = generate_ge_mask(spec_shape, loss_rate=rate / 100.0)
-
+                        continue
+                    token = f"{seed}:{rate}:{sample_id}".encode("utf-8")
+                    item_seed = int.from_bytes(hashlib.sha256(token).digest()[:4], "little")
+                    state = np.random.get_state()
+                    try:
+                        np.random.seed(item_seed)
+                        trace = generate_ge_trace_bursty(valid_t, float(rate) / 100.0)
+                    finally:
+                        np.random.set_state(state)
+                    mask = trace_to_spec_mask(trace, spec_shape)
                     if ds_name in h5f:
-                        del h5f[ds_name]  # overwrite=True path
+                        del h5f[ds_name]
                     h5f.create_dataset(ds_name, data=mask, compression="gzip")
 
-                global_idx += 1  # increment ONCE per sample, AFTER all rates
-
-        logging.info(f"Done: {chunk_file}")
-
-    logging.info(f"Finished. Total samples processed: {global_idx}")
+    logging.info("Finished deterministic valid-length test-mask cache update.")
 
 # -------------------- entry --------------------
-if __name__ == "__main__":
+def main():
+    import argparse
 
-    # For GRID test set:
-    update_h5_test_masks(
-        base_path='/home/ai/Projects/Mahsa/datasets/grid/grid_test_features',
-        chunk_pattern='_chunk*.h5',
-        seed=42,
-        loss_rates=(1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 99),
+    parser = argparse.ArgumentParser(
+        description="Build shared HDF5 features while adding the waveform/aligned-frame data required by AV_PLC."
     )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--videos", nargs="+", help="Video glob pattern(s); recursive ** is supported.")
+    source.add_argument("--list-file", type=str, help="Split file with one relative video id per line.")
+    parser.add_argument("--root", type=str, default=None, help="Root used with --list-file.")
+    parser.add_argument("--extension", type=str, default=".mp4", help="Extension appended to ids from --list-file.")
+    parser.add_argument("--output", required=True, help="Output base HDF5 path; write mode creates _chunkN files.")
+    parser.add_argument("--reference-face", required=True, help="Reference face .npy built by AV_PLC.build_reference_face.")
+    parser.add_argument("--audio-dtype", choices=["float32", "int16"], default="float32")
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--chunk-size", type=int, default=1000)
+    args = parser.parse_args()
 
-    #### Keep threads/processes tame (helps avoid SIGKILL on laptops)
+    os.environ["AVPLC_REFERENCE_FACE"] = os.path.abspath(args.reference_face)
+    os.environ["AVPLC_AUDIO_STORAGE_DTYPE"] = args.audio_dtype
+    global AUDIO_STORAGE_DTYPE
+    AUDIO_STORAGE_DTYPE = args.audio_dtype
+
+    if args.videos:
+        video_list = []
+        for pattern in args.videos:
+            video_list.extend(glob.glob(pattern, recursive=True))
+        video_list = sorted(set(video_list))
+    else:
+        if not args.root:
+            parser.error("--root is required with --list-file")
+        video_list = load_video_list_from_txt(args.list_file, args.root, extension=args.extension)
+
+    if not video_list:
+        raise FileNotFoundError("No input videos were found")
+
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     try:
@@ -596,33 +650,11 @@ if __name__ == "__main__":
         pass
     torch.set_num_threads(1)
     multiprocessing.set_start_method("spawn", force=True)
-
-    splits = {"pretrain"}  # add "test", "val", "train"
-    dataset_name = "lrs2"
-    for split in splits:
-        if dataset_name == "grid":
-            path = f'/home/nabizadz/Projects/Mahsa/datasets/grid/{split}/'
-            video_list = glob.glob(os.path.join(path, 's*/*.mpg'))
-
-            feats_filename = f'datasets/grid/grid_{split}_features.h5'
-            extract_features_parallel(video_list, feats_filename)
-
-            #feats_path = f'datasets/grid/grid_{split}_features'
-            #update_h5_parallel(feats_path)
-        elif dataset_name == "lrs2":
-            if split == "pretrain":
-
-                root_path = "/home/nabizadz/Projects/Mahsa/datasets/lrs2/lrs2_v1/mvlrs_v1/pretrain"
-                txt_file = f"/home/nabizadz/Projects/Mahsa/datasets/lrs2/pretrain.txt"
-                video_list = load_video_list_from_txt(txt_file, root_path)
-
-            else:
-                root_path = "/home/nabizadz/Projects/Mahsa/datasets/lrs2/lrs2_v1/mvlrs_v1/main"
-                txt_file = f"/home/nabizadz/Projects/Mahsa/datasets/lrs2/{split}.txt"
-                video_list = load_video_list_from_txt(txt_file, root_path)
-
-            feats_filename = f"datasets/lrs2/lrs2_{split}_features.h5"
-            extract_features_parallel(video_list, feats_filename)
+    extract_features_parallel(
+        video_list, args.output, num_workers=args.num_workers,
+        chunk_size=args.chunk_size, mode="w",
+    )
 
 
-
+if __name__ == "__main__":
+    main()

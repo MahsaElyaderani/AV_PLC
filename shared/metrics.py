@@ -293,7 +293,12 @@ def calculate_batch_metrics(original_batch, reconstructed_batch,
                             hifigan_vocoder=None, tokenizer=None,
                             sample_rate=16000, asr_lang="en",
                             mel_mean=-56.775, mel_std=19.707, masked_input=False,
-                            reconstructed_audio_batch=None):
+                            reconstructed_audio_batch=None,
+                            original_audio_batch=None,
+                            sample_mask_batch=None,
+                            audio_lengths=None,
+                            frame_valid_batch=None,
+                            normalize_wer_text=False):
 
     get_asr_model()
 
@@ -307,16 +312,30 @@ def calculate_batch_metrics(original_batch, reconstructed_batch,
         try:
             if original_batch is not None and reconstructed_batch is not None:
 
-                rel_path = path[i].split("datasets", 1)[-1].lstrip(os.sep)
-                audio_path = os.path.join(str(DATA_ROOT), rel_path)
-                original_audio_np = load_audio_ffmpeg(audio_path, sr=sample_rate, fixlen_sec=3)
+                if original_audio_batch is not None:
+                    original_audio_np = np.asarray(
+                        original_audio_batch[i].detach().cpu() if torch.is_tensor(original_audio_batch[i])
+                        else original_audio_batch[i], dtype=np.float32
+                    ).squeeze()
+                else:
+                    rel_path = path[i].split("datasets", 1)[-1].lstrip(os.sep)
+                    audio_path = os.path.join(str(DATA_ROOT), rel_path)
+                    original_audio_np = load_audio_ffmpeg(audio_path, sr=sample_rate, fixlen_sec=3)
 
                 # AV/audio PLC uses a mask and inserts only the reconstructed gap.
                 # Video-only synthesis passes mask=None and must be evaluated over
                 # the complete synthesized waveform.
                 
                 sample_mask = None
-                if mask is not None:
+                # A sample-domain mask is meaningful only for PLC conditions.
+                # Video-only synthesis deliberately passes mask=None and must
+                # be scored over the complete synthesized waveform.
+                if sample_mask_batch is not None and (mask is not None or masked_input):
+                    sample_mask = np.asarray(
+                        sample_mask_batch[i].detach().cpu() if torch.is_tensor(sample_mask_batch[i])
+                        else sample_mask_batch[i], dtype=np.float32
+                    ).squeeze()[:len(original_audio_np)]
+                elif mask is not None:
                     time_keep = mask[i, 0].cpu().numpy().astype(np.float32)
                     sample_mask = np.repeat(time_keep, 160)[:len(original_audio_np)]
                     if len(sample_mask) < len(original_audio_np):
@@ -366,8 +385,23 @@ def calculate_batch_metrics(original_batch, reconstructed_batch,
                             + reconstructed_audio[:n] * (1.0 - sample_mask[:n])
                         )
 
+                if audio_lengths is not None:
+                    valid_n = int(audio_lengths[i])
+                    valid_n = max(0, min(valid_n, len(original_audio_np), len(reconstructed_audio_np)))
+                    original_audio_np = original_audio_np[:valid_n]
+                    reconstructed_audio_np = reconstructed_audio_np[:valid_n]
+
                 original_batch_np = original_batch[i].cpu().numpy()
                 reconstructed_batch_np = reconstructed_batch[i].cpu().numpy()
+                if frame_valid_batch is not None:
+                    fv = np.asarray(
+                        frame_valid_batch[i].detach().cpu() if torch.is_tensor(frame_valid_batch[i])
+                        else frame_valid_batch[i], dtype=bool
+                    ).reshape(-1)
+                    n_t = min(original_batch_np.shape[-1], reconstructed_batch_np.shape[-1], fv.size)
+                    fv = fv[:n_t]
+                    original_batch_np = original_batch_np[..., :n_t][..., fv]
+                    reconstructed_batch_np = reconstructed_batch_np[..., :n_t][..., fv]
 
                 # --------- MSE, PSNR, PESQ, STOI metrics ----------
                 batch_metrics['mse'].append(calculate_mse(original_batch_np, reconstructed_batch_np))
@@ -390,6 +424,9 @@ def calculate_batch_metrics(original_batch, reconstructed_batch,
                 #ref_text = asr_transcribe_np(original_audio_np, language=asr_lang)
                 ref_text = text_decoder.decode(texts[i])
                 hyp_text = asr_transcribe_np(reconstructed_audio_np, language=asr_lang)
+                if normalize_wer_text:
+                    ref_text = text_decoder.normalize_text(ref_text)
+                    hyp_text = text_decoder.normalize_text(hyp_text)
 
                 wer_score, cer_score = compute_wer_cer(ref_text, hyp_text)
                 batch_metrics['wer'].append(wer_score)

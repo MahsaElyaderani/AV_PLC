@@ -25,7 +25,8 @@ from audio_encoder import Audio_Encoder
 from multimodal_decoder import AV_PLC
 from av_dataloader import AVDataloader
 from shared.metrics import calculate_pesq, calculate_stoi
-from shared.audio_processing import load_audio_ffmpeg, librosa_mel2audio
+from AV_PLC.batch_utils import split_waveform_aux
+from shared.audio_processing import librosa_mel2audio
 
 
 mpl.rcParams.update({
@@ -268,10 +269,9 @@ def _get_dataset_stats(loader):
         dataset = dataset.base_dataset
     while hasattr(dataset, "dataset"):
         dataset = dataset.dataset
-    return (
-        float(getattr(dataset, "mel_mean", -56.775)),
-        float(getattr(dataset, "mel_std", 19.707)),
-    )
+    if not hasattr(dataset, "mel_mean") or not hasattr(dataset, "mel_std"):
+        raise RuntimeError("AV_PLC dataset is missing active mel_mean/mel_std; generate AV_PLC/mel_stats/<dataset>.json first.")
+    return float(dataset.mel_mean), float(dataset.mel_std)
 
 
 def insert_reconstructed_gap(original_audio, reconstructed_audio, mask, hop_length=160):
@@ -280,9 +280,9 @@ def insert_reconstructed_gap(original_audio, reconstructed_audio, mask, hop_leng
     reconstructed_audio = np.asarray(reconstructed_audio, dtype=np.float32).squeeze()
 
     if torch.is_tensor(mask):
-        time_keep = mask[0].detach().cpu().numpy().astype(np.float32)
+        time_keep = mask.detach().cpu().numpy().astype(np.float32).squeeze()
     else:
-        time_keep = np.asarray(mask[0], dtype=np.float32)
+        time_keep = np.asarray(mask, dtype=np.float32).squeeze()
 
     waveform_mask = np.repeat(time_keep, hop_length)
     n = min(len(original_audio), len(reconstructed_audio), len(waveform_mask))
@@ -642,7 +642,8 @@ def evaluate_audio_model(
     stoi_values = []
 
     for batch_idx, batch in enumerate(loader):
-        masked_spec, mel_spec, audio_length, text, mask, video_path = batch
+        core, clean_audio, sample_mask, _frame_valid, _soft_keep = split_waveform_aux(batch)
+        masked_spec, mel_spec, audio_length, text, mask, video_path = core
 
         masked_spec = masked_spec.to(device).float()
         mel_spec = mel_spec.to(device).float()
@@ -652,8 +653,8 @@ def evaluate_audio_model(
         B = pred_mel.size(0)
 
         for i in range(B):
-            path_i = resolve_audio_path(video_path[i], dataset_root)
-            ref_audio = load_audio_ffmpeg(path_i, sr=sample_rate, fixlen_sec=3)
+            n_valid = int(audio_length[i]) if torch.is_tensor(audio_length) else int(audio_length[i])
+            ref_audio = clean_audio[i].detach().cpu().numpy()[:n_valid]
 
             reconstructed_audio = librosa_mel2audio(
                 pred_mel[i].detach().cpu(), sr=sample_rate, mel_mean=mel_mean, mel_std=mel_std)
@@ -663,8 +664,8 @@ def evaluate_audio_model(
             pred_audio = insert_reconstructed_gap(
                 original_audio=ref_audio,
                 reconstructed_audio=reconstructed_audio,
-                mask=mask[i],
-                hop_length=160,
+                mask=sample_mask[i],
+                hop_length=1,
             )
             n = min(len(ref_audio), len(pred_audio))
             pesq_score = calculate_pesq(ref_audio[:n], pred_audio[:n], sr=sample_rate)
@@ -709,20 +710,21 @@ def evaluate_av_model(
     stoi_values = []
 
     for batch_idx, batch in enumerate(loader):
+        core, clean_audio, sample_mask, _frame_valid, _soft_keep = split_waveform_aux(batch)
         (
             frames,
             spk_emb,
             masked_spec,
             mel_spec,
+            _video_aligned_spec,
             audio_length,
             text,
             mask,
             video_path,
             avail,
-        ) = batch
+        ) = core
 
         frames = frames.to(device).float()
-        spk_emb = spk_emb.to(device).float()
         masked_spec = masked_spec.to(device).float()
         mel_spec = mel_spec.to(device).float()
         avail = avail.to(device).bool()
@@ -730,16 +732,17 @@ def evaluate_av_model(
         fused_mel, _, _ = model(
             masked_spec,
             frames,
-            spk_emb,
+            None,
             audio_length,
             avail=avail,
+            audio_mask=mask.to(device).float(),
         )
 
         B = fused_mel.size(0)
 
         for i in range(B):
-            path_i = resolve_audio_path(video_path[i], dataset_root)
-            ref_audio = load_audio_ffmpeg(path_i, sr=sample_rate, fixlen_sec=3)
+            n_valid = int(audio_length[i]) if torch.is_tensor(audio_length) else int(audio_length[i])
+            ref_audio = clean_audio[i].detach().cpu().numpy()[:n_valid]
 
             reconstructed_audio = librosa_mel2audio(
                 fused_mel[i].detach().cpu(), sr=sample_rate, mel_mean=mel_mean, mel_std=mel_std)
@@ -749,8 +752,8 @@ def evaluate_av_model(
             pred_audio = insert_reconstructed_gap(
                 original_audio=ref_audio,
                 reconstructed_audio=reconstructed_audio,
-                mask=mask[i],
-                hop_length=160,
+                mask=sample_mask[i],
+                hop_length=1,
             )
             n = min(len(ref_audio), len(pred_audio))
             pesq_score = calculate_pesq(ref_audio[:n], pred_audio[:n], sr=sample_rate)

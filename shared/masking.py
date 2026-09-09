@@ -88,3 +88,61 @@ def generate_single_gap_mask(spec_shape, gap_ms, sample_id, seed=42, hop_ms=10.0
     mask = np.ones((freq_bins, time_frames), dtype=np.float32)
     mask[:, start:start + gap_frames] = 0.0
     return mask
+
+# ---------------------------------------------------------------------------
+# Additive valid-length helpers.  Existing mask APIs above are intentionally
+# unchanged because AV_LSTM/AV_S2S/AV_Transformer reproduce spectrogram-domain
+# methods.  These helpers expose the common 1-D packet trace so every project
+# can use the same valid 10-ms packet locations.
+# ---------------------------------------------------------------------------
+
+def generate_ge_trace_bursty(time_steps, loss_rate):
+    """Return a 1-D Gilbert-Elliott keep trace of length ``time_steps``."""
+    time_steps = int(time_steps)
+    if time_steps <= 0:
+        return np.ones((0,), dtype=np.float32)
+    model = GilbertElliottModel(
+        loss_rate=loss_rate,
+        p_range=(0.001, 0.80),
+        q_range=(0.025, 0.06),
+    )
+    burn_in = 10
+    trace = [model.step() for _ in range(time_steps + burn_in)]
+    return np.asarray([1 - x for x in trace[burn_in:]], dtype=np.float32)
+
+
+def generate_single_gap_trace(time_steps, gap_ms, sample_id, seed=42, hop_ms=10.0):
+    """Deterministic 1-D contiguous keep trace (1=kept, 0=lost)."""
+    import hashlib
+    time_steps = int(time_steps)
+    if time_steps <= 0:
+        return np.ones((0,), dtype=np.float32)
+    if gap_ms <= 0:
+        raise ValueError(f"gap_ms must be positive, got {gap_ms}")
+    gap_frames = max(1, int(round(float(gap_ms) / float(hop_ms))))
+    gap_frames = min(gap_frames, time_steps)
+    token = f"{int(seed)}:{float(gap_ms):g}:{sample_id}".encode("utf-8")
+    item_seed = int.from_bytes(hashlib.sha256(token).digest()[:8], "little")
+    rng = np.random.default_rng(item_seed)
+    start = int(rng.integers(0, time_steps - gap_frames + 1))
+    trace = np.ones(time_steps, dtype=np.float32)
+    trace[start:start + gap_frames] = 0.0
+    return trace
+
+
+def packet_count_from_audio_len(audio_len, packet_samples=160):
+    audio_len = max(0, int(audio_len))
+    return (audio_len + int(packet_samples) - 1) // int(packet_samples)
+
+
+def trace_to_spec_mask(trace, spec_shape):
+    """Fill valid trace into a full [F,T] mask; padded tail is always kept."""
+    if len(spec_shape) != 2:
+        raise ValueError(f"spec_shape must be (F,T), got {spec_shape}")
+    f, t = map(int, spec_shape)
+    trace = np.asarray(trace, dtype=np.float32).reshape(-1)
+    mask = np.ones((f, t), dtype=np.float32)
+    n = min(t, trace.size)
+    if n:
+        mask[:, :n] = trace[:n][None, :]
+    return mask

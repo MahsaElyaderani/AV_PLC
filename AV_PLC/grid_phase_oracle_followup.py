@@ -75,8 +75,10 @@ if str(ROOT) not in sys.path:
 from evaluations.runtime_config import SEED, project_checkpoint_dir, project_log_dir, set_global_seed
 from AV_PLC.av_dataloader import AVDataloader
 from AV_PLC.multimodal_decoder import AV_PLC
-from shared.audio_processing import hop_len, n_fft, read_gt_input, sample_rate, torch_melphase2audio, win_len
+from shared.audio_processing import hop_len, n_fft, sample_rate, win_len
 from shared.metrics import calculate_batch_metrics  # noqa: E402
+from AV_PLC.batch_utils import split_waveform_aux
+from AV_PLC.diagnostic_audio import make_frontend, mel_phase_to_audio, fresh_stft, observed_stft
 
 # --------------------------------------------------------------------------------------
 # Experiment constants: intentionally identical to the previous oracle script.
@@ -169,6 +171,7 @@ def make_loader(args, gap_ms: int):
         jitter_p=1.0,
         jitter_max_frames=8,
         phase_reconstruction=True,
+        frontend_lookahead_ms=args.frontend_lookahead_ms,
     )
     return factory.test_dataloader(
         mask_range="10",  # ignored by deterministic single-gap generation
@@ -183,42 +186,24 @@ def dataset_stats(loader):
     while hasattr(ds, "dataset"):
         ds = ds.dataset
     return (
-        float(getattr(ds, "mel_mean", -56.775)),
-        float(getattr(ds, "mel_std", 19.707)),
+        float(ds.mel_mean),
+        float(ds.mel_std),
     )
 
 
 def unpack(batch, device: torch.device):
-    if len(batch) != 12:
-        raise ValueError(
-            "Expected the current phase-enabled AV batch with 12 elements; "
-            f"got {len(batch)}."
-        )
-    (
-        visual,
-        spk,
-        masked,
-        spec,
-        video_spec,
-        phase,
-        video_phase,
-        length,
-        text,
-        mask,
-        path,
-        avail,
-    ) = batch
-
+    core, clean_audio, sample_mask, frame_valid, _soft_keep = split_waveform_aux(batch)
+    if len(core) != 14:
+        raise ValueError(f"Expected phase-enabled AV core batch with 14 elements; got {len(core)}")
+    (visual, spk, masked, spec, _video_spec, stft_mag, _video_mag, phase, _video_phase,
+     length, text, mask, path, _avail) = core
     return (
-        visual.float().to(device, non_blocking=True),
-        spk.float().to(device, non_blocking=True),
-        masked.float().to(device, non_blocking=True),
-        spec.float().to(device, non_blocking=True),
-        phase.float().to(device, non_blocking=True),
-        length.long().to(device, non_blocking=True),
-        text,
-        mask.float().to(device, non_blocking=True),
-        path,
+        visual.float().to(device, non_blocking=True), spk.float().to(device, non_blocking=True),
+        masked.float().to(device, non_blocking=True), spec.float().to(device, non_blocking=True),
+        stft_mag.float().to(device, non_blocking=True), phase.float().to(device, non_blocking=True),
+        length.long().to(device, non_blocking=True), text,
+        mask.float().to(device, non_blocking=True), path,
+        clean_audio.float(), sample_mask.float(), frame_valid.bool(),
     )
 
 
@@ -235,15 +220,16 @@ def force_av(batch_size: int, device: torch.device):
     return torch.tensor([True, True], dtype=torch.bool, device=device).unsqueeze(0).repeat(batch_size, 1)
 
 
-def forward_av(model, visual, spk, masked, length, mask, phase):
+def forward_av(model, visual, masked, length, mask, phase=None, stft_magnitude=None):
     out = model(
         masked,
         visual,
-        spk,
+        None,
         length,
         avail=force_av(masked.size(0), masked.device),
         audio_mask=mask,
         phase=phase,
+        stft_magnitude=stft_magnitude,
     )
     if not isinstance(out, (tuple, list)) or len(out) != 4:
         raise RuntimeError("Expected latent_spectral_v2 AV_PLC to return four outputs.")
@@ -271,31 +257,22 @@ class MetricAcc:
         return {k: self.s[k] / self.n[k] for k in self.s if self.n[k] > 0}
 
 
-def metric_batch(spec, recon_mel, text, mask, path, mel_mean, mel_std, recon_audio=None):
-    """Use the exact shared metric implementation used by the current evaluator."""
+def metric_batch(spec, recon_mel, text, mask, path, mel_mean, mel_std,
+                 clean_audio, sample_mask, audio_length, frame_valid, recon_audio=None):
     kwargs = dict(
-        original_batch=spec.detach().cpu(),
-        reconstructed_batch=recon_mel.detach().cpu(),
-        texts=text,
-        mask=mask.detach().cpu(),
-        path=list(path),
-        hifigan_vocoder=None,
-        tokenizer=None,
-        max_samples=spec.size(0),
-        sample_rate=sample_rate,
-        mel_mean=mel_mean,
-        mel_std=mel_std,
-        masked_input=False,
+        original_batch=spec.detach().cpu(), reconstructed_batch=recon_mel.detach().cpu(),
+        texts=text, mask=mask.detach().cpu(), path=list(path), hifigan_vocoder=None,
+        tokenizer=None, max_samples=spec.size(0), sample_rate=sample_rate,
+        mel_mean=mel_mean, mel_std=mel_std, masked_input=False,
+        original_audio_batch=clean_audio.detach().cpu(),
+        sample_mask_batch=sample_mask.detach().cpu(),
+        audio_lengths=audio_length.detach().cpu(),
+        frame_valid_batch=frame_valid.detach().cpu(), normalize_wer_text=True,
     )
     if recon_audio is not None:
         kwargs["reconstructed_audio_batch"] = recon_audio.detach().cpu()
-
-    # GT/completed controls may make PSNR undefined in the project's metric
-    # helper when MSE==0. Suppress only that numpy reduction warning.
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", message="Mean of empty slice", category=RuntimeWarning
-        )
+        warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
         return calculate_batch_metrics(**kwargs)
 
 
@@ -376,16 +353,17 @@ def run_F_and_A0(args, gap: int, device: torch.device, model):
     """
     loader = make_loader(args, gap)
     mel_mean, mel_std = dataset_stats(loader)
+    frontend = make_frontend(mel_mean, mel_std, args.frontend_lookahead_ms)
     A0, F_oracle = MetricAcc(), MetricAcc()
     sig = []
 
     for batch in loader:
-        visual, spk, masked, spec, phase, length, text, mask, path = unpack(batch, device)
+        visual, spk, masked, spec, stft_mag, phase, length, text, mask, path, clean_audio, sample_mask, frame_valid = unpack(batch, device)
         sig += signature(path, mask)
         bs = spec.size(0)
 
         c = forward_av(
-            model, visual, spk, masked, length, mask, phase=None
+            model, visual, masked, length, mask, phase=None
         )
         completed_mel = c["completed_mel"].float()
 
@@ -409,23 +387,20 @@ def run_F_and_A0(args, gap: int, device: torch.device, model):
         A0.add(
             metric_batch(
                 spec, completed_mel, text, mask, path, mel_mean, mel_std,
-                recon_audio=None,
+                clean_audio, sample_mask, length, frame_valid, recon_audio=None,
             ),
             bs,
         )
 
         # F: exactly the same completed Mel, but with stored GT phase.
-        f_audio = torch_melphase2audio(
-            completed_mel,
-            torch.cos(phase),
-            torch.sin(phase),
-            mel_mean=mel_mean,
-            mel_std=mel_std,
+        f_audio = mel_phase_to_audio(
+            completed_mel, torch.cos(phase), torch.sin(phase), frontend,
+            output_length=clean_audio.size(-1),
         )
         F_oracle.add(
             metric_batch(
                 spec, completed_mel, text, mask, path, mel_mean, mel_std,
-                recon_audio=f_audio,
+                clean_audio, sample_mask, length, frame_valid, recon_audio=f_audio,
             ),
             bs,
         )
@@ -436,65 +411,17 @@ def run_F_and_A0(args, gap: int, device: torch.device, model):
 # --------------------------------------------------------------------------------------
 # Exact STFT magnitude for phase-error analysis
 # --------------------------------------------------------------------------------------
-def true_stft_batch(path, mask, stored_phase, device):
-    """Return exact one-sided GT STFT magnitude aligned with stored phase.
-
-    This reproduces the same forward STFT geometry validated by condition E:
-      n_fft=512, win=400, hop=160, center=False, pad=(n_fft-hop)/2=176.
-    """
-    pad = (n_fft - hop_len) // 2
-    window = torch.hann_window(
-        win_len, periodic=True, dtype=torch.float32, device=device
-    )
-
-    wavs = []
-    for i, p in enumerate(path):
-        original, _ = read_gt_input(str(p), mask[i])
-        wavs.append(torch.as_tensor(original, dtype=torch.float32, device=device))
-    lengths = {w.numel() for w in wavs}
-    if len(lengths) != 1:
-        raise RuntimeError(f"Expected fixed 3-s waveforms, got lengths={sorted(lengths)}")
-    wav = torch.stack(wavs, dim=0)
-
-    stft = torch.stft(
-        F.pad(wav, (pad, pad)),
-        n_fft=n_fft,
-        hop_length=hop_len,
-        win_length=win_len,
-        window=window,
-        center=False,
-        normalized=False,
-        onesided=True,
-        return_complex=True,
-    )
-    if tuple(stft.shape) != tuple(stored_phase.shape):
-        raise RuntimeError(
-            f"GT STFT shape {tuple(stft.shape)} != stored phase shape {tuple(stored_phase.shape)}"
-        )
-
-    # Independent alignment guard. At bins with effectively zero magnitude the
-    # phase is physically irrelevant, so use magnitude weighting for this check.
-    fresh_phase = torch.angle(stft)
-    d = stored_phase.to(device) - fresh_phase
-    d = torch.atan2(torch.sin(d), torch.cos(d)).abs()
-    mag = stft.abs()
-    phase_mae_weighted = (d * mag).sum() / mag.sum().clamp_min(EPS)
-
-    return mag, float(phase_mae_weighted.item())
-
-
-# --------------------------------------------------------------------------------------
-# Phase error definitions: exactly match the three current phase losses.
-# --------------------------------------------------------------------------------------
-def circular_error_from_unit(pred_cos, pred_sin, target_cos, target_sin):
-    # cos(pred-target)
-    dot = pred_cos * target_cos + pred_sin * target_sin
-    # sin(pred-target)
-    cross = pred_sin * target_cos - pred_cos * target_sin
-    dot = dot.clamp(-1.0, 1.0)
-    circular = 1.0 - dot
-    angle_abs = torch.atan2(cross, dot).abs()
-    return circular, angle_abs
+def true_stft_batch(clean_audio, stored_mag, stored_phase, frontend, device):
+    fresh = fresh_stft(clean_audio, frontend, device=device)
+    if tuple(fresh.shape) != tuple(stored_phase.shape):
+        raise RuntimeError(f"Fresh GT STFT shape {tuple(fresh.shape)} != stored phase {tuple(stored_phase.shape)}")
+    d = stored_phase.to(device) - torch.angle(fresh)
+    d = torch.atan2(torch.sin(d), torch.cos(d))
+    phase_mae = float(d.abs().mean().item())
+    mag_mae = float((stored_mag.to(device) - fresh.abs()).abs().mean().item())
+    if mag_mae > 1e-4:
+        raise RuntimeError(f"Stored magnitude is not aligned with active STFT (MAE={mag_mae:.3e})")
+    return fresh.abs(), phase_mae
 
 
 def phase_difference(c0, s0, c1, s1):
@@ -831,16 +758,22 @@ def run_phase_error_diagnostic(
     collectors: ErrorCollectors,
 ):
     loader = make_loader(args, gap)
+    mel_mean, mel_std = dataset_stats(loader)
+    frontend = make_frontend(mel_mean, mel_std, args.frontend_lookahead_ms)
     sig = []
     alignment_sum = 0.0
     alignment_n = 0
 
     for batch in loader:
-        visual, spk, masked, spec, phase, length, text, mask, path = unpack(batch, device)
+        visual, spk, masked, spec, stft_mag, phase, length, text, mask, path, clean_audio, sample_mask, frame_valid = unpack(batch, device)
         sig += signature(path, mask)
         bs = spec.size(0)
 
-        c = forward_av(model, visual, spk, masked, length, mask, phase=phase)
+        obs = observed_stft(clean_audio, sample_mask, frontend, device)
+        c = forward_av(
+            model, visual, masked, length, mask,
+            phase=torch.angle(obs), stft_magnitude=obs.abs(),
+        )
         prediction_mask = c["prediction_mask"].float()
 
         expected_prediction_mask = 1.0 - mask.float().mean(dim=1)
@@ -850,7 +783,7 @@ def run_phase_error_diagnostic(
                 f"Phase-model prediction_mask disagrees with PLC mask (max abs diff={maxerr:.3e})."
             )
 
-        gt_mag, align_mae = true_stft_batch(path, mask, phase, device)
+        gt_mag, align_mae = true_stft_batch(clean_audio, stft_mag, phase, frontend, device)
         alignment_sum += align_mae * bs
         alignment_n += bs
 
@@ -918,6 +851,7 @@ def main():
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--checkpoint-root", default=None)
     ap.add_argument("--output-dir", default=None)
+    ap.add_argument("--frontend-lookahead-ms", type=float, default=7.5)
     ap.add_argument(
         "--previous-oracle-summary",
         default=None,

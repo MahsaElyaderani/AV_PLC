@@ -150,20 +150,15 @@ class AV_PLC(nn.Module):
 
     @staticmethod
     def _audio_reliability(dec_input, audio_mask, target_steps):
-        """Return [B,T] reliability, with 1=observed and 0=PLC gap."""
-        if audio_mask is not None:
-            if audio_mask.dim() == 3:
-                reliability = audio_mask.float().mean(dim=1)
-            elif audio_mask.dim() == 2:
-                reliability = audio_mask.float()
-            else:
-                raise ValueError("audio_mask must be [B,F,T] or [B,T].")
+        """Return explicit [B,T] waveform-derived reliability (1=fully observed)."""
+        if audio_mask is None:
+            raise ValueError("audio_mask is required for waveform-domain AV_PLC")
+        if audio_mask.dim() == 3:
+            reliability = audio_mask.float().mean(dim=1)
+        elif audio_mask.dim() == 2:
+            reliability = audio_mask.float()
         else:
-            if dec_input is None:
-                raise ValueError("dec_input or audio_mask is required to infer audio reliability")
-            # Current dataloader zeros every Mel bin in missing frames.
-            reliability = (dec_input.abs().amax(dim=1) > 1e-8).float()
-
+            raise ValueError("audio_mask must be [B,F,T] or [B,T].")
         if reliability.size(1) != target_steps:
             reliability = F.interpolate(
                 reliability.unsqueeze(1), size=target_steps, mode="nearest"
@@ -281,8 +276,8 @@ class AV_PLC(nn.Module):
                 raise ValueError("Video-present samples require enc_input")
             idx = v_on.nonzero(as_tuple=True)[0]
             v_in = enc_input[idx]
-            spk_sub = spk_emb[idx] if spk_emb is not None else None
-            vmel_sub, vfeat_sub = self.video_enc(v_in, spk_sub)
+            # Speaker embeddings are retained in the dataset for metrics only.
+            vmel_sub, vfeat_sub = self.video_enc(v_in)
 
             batch = avail.size(0)
             vmel = vmel_sub.new_zeros((batch,) + vmel_sub.shape[1:])
@@ -380,6 +375,17 @@ class AV_PLC(nn.Module):
                 raise RuntimeError("Video-only sample is missing the video Mel head")
             selected_mel[only_v] = vmel[only_v]
 
+        # Completed Mel is the physically meaningful PLC Mel: copy only frames
+        # whose waveform support is fully observed; predict every affected frame.
+        if dec_input is not None:
+            observed_mel = dec_input
+            if observed_mel.size(-1) != target_steps:
+                observed_mel = F.interpolate(observed_mel, size=target_steps, mode="nearest")
+            r_mel = packet_reliability.to(selected_mel.dtype).unsqueeze(1)
+            completed_mel = r_mel * observed_mel + (1.0 - r_mel) * selected_mel
+        else:
+            completed_mel = selected_mel
+
         # --------------------- parallel magnitude/phase TF branch ---------------------
         phase_reliability = None
         mp_out = None
@@ -399,7 +405,7 @@ class AV_PLC(nn.Module):
 
             phase_reliability = packet_reliability
             mp_out = self.phase_completion(
-                reconstructed_mel=selected_mel,
+                reconstructed_mel=completed_mel,
                 observed_magnitude=stft_magnitude,
                 phase_radians=phase,
                 reliability=phase_reliability,
@@ -408,6 +414,7 @@ class AV_PLC(nn.Module):
             # Mel content heads / selected content representation.
             "predicted_mel": selected_mel,  # compatibility alias
             "selected_mel": selected_mel,
+            "completed_mel": completed_mel,
             "fused_mel": fused_mel,
             "audio_mel": amel,
             "video_mel": vmel,

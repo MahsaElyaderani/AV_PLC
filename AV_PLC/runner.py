@@ -25,7 +25,8 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
                         phase_complex_loss=True, phase_init_checkpoint=None,
                         w_phase_unit=0.10,
                         w_phase_temporal=0.05, w_phase_frequency=0.05,
-                        w_phase_complex=0.10):
+                        w_phase_complex=0.10, frontend_lookahead_ms=7.5,
+                        mel_stats_path=None):
     set_global_seed(SEED)
     if phase_reconstruction and mode != "av":
         raise ValueError("Learned phase reconstruction is implemented in AV_PLC; use --mode av.")
@@ -62,7 +63,7 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
                   f"{'_pesq_0.01' if pesq_flag else ''}"
                   f"{'_stoi_0.01' if stoi_flag else ''}"
                   f"{'_asr_0.1' if asr_flag else ''}"
-                  f"_latent_spectral_v2"
+                  f"_latent_spectral_v2_waveform_align96_L{frontend_lookahead_ms:g}ms"
                   f"{'_phase_recon' if phase_reconstruction else ''}"
                   f"{'_complex_v1' if use_phase_complex_loss else ''}"
                   f"({dataset_name})")
@@ -98,7 +99,9 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
                                      dataset_name=dataset_name,
                                      batch_size=batch_size, num_workers=8,
                                      dropout_modality=l2s_flag, video_aug=True,
-                                     phase_reconstruction=phase_reconstruction,)
+                                     phase_reconstruction=phase_reconstruction,
+                                     frontend_lookahead_ms=frontend_lookahead_ms,
+                                     mel_stats_path=mel_stats_path,)
         train_loader = av_dataloader.train_dataloader()
         val_loader = av_dataloader.val_dataloader()
 
@@ -134,6 +137,9 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             w_phase_temporal=w_phase_temporal,
             w_phase_frequency=w_phase_frequency,
             w_phase_complex=w_phase_complex,
+            mel_mean=av_dataloader.mel_mean,
+            mel_std=av_dataloader.mel_std,
+            frontend_lookahead_ms=frontend_lookahead_ms,
         )
 
         start_epoch = trainer.load_checkpoint(load_best=True)
@@ -150,7 +156,9 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
                                      dataset_name=dataset_name,
                                      batch_size=batch_size, num_workers=4,
                                      dropout_modality=False, video_aug=False,
-                                     phase_reconstruction=phase_reconstruction)
+                                     phase_reconstruction=phase_reconstruction,
+                                     frontend_lookahead_ms=frontend_lookahead_ms,
+                                     mel_stats_path=mel_stats_path)
 
         trainer = Trainer(
             model=model,
@@ -184,6 +192,9 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             w_phase_temporal=w_phase_temporal,
             w_phase_frequency=w_phase_frequency,
             w_phase_complex=w_phase_complex,
+            mel_mean=av_dataloader.mel_mean,
+            mel_std=av_dataloader.mel_std,
+            frontend_lookahead_ms=frontend_lookahead_ms,
         )
         trainer.load_checkpoint(os.path.join(checkpoint_dir, model_name, "best_model.pt"))
 
@@ -275,6 +286,10 @@ if __name__ == "__main__":
     parser.add_argument("--w-phase-temporal", type=float, default=0.05)
     parser.add_argument("--w-phase-frequency", type=float, default=0.05)
     parser.add_argument("--w-phase-complex", type=float, default=0.10)
+    parser.add_argument("--frontend-lookahead-ms", type=float, default=7.5,
+                        help="Audio STFT lookahead in milliseconds. 7.5 reproduces the legacy frame timing.")
+    parser.add_argument("--mel-stats", type=str, default=None,
+                        help="JSON produced by AV_PLC.compute_audio_stats. If omitted, use AV_PLC/mel_stats/<dataset>.json.")
     args = parser.parse_args()
 
     av_conformer_runner(mode=args.mode, phase=args.phase,
@@ -293,4 +308,6 @@ if __name__ == "__main__":
                    w_phase_unit=args.w_phase_unit,
                    w_phase_temporal=args.w_phase_temporal,
                    w_phase_frequency=args.w_phase_frequency,
-                   w_phase_complex=args.w_phase_complex)
+                   w_phase_complex=args.w_phase_complex,
+                   frontend_lookahead_ms=args.frontend_lookahead_ms,
+                   mel_stats_path=args.mel_stats)

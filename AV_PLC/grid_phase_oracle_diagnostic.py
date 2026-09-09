@@ -46,12 +46,13 @@ from shared.audio_processing import (
     _manual_istft_center_false,
     hop_len,
     n_fft,
-    read_gt_input,
     sample_rate,
     torch_melphase2audio,
     win_len,
 )
 from shared.metrics import calculate_batch_metrics
+from AV_PLC.batch_utils import split_waveform_aux
+from AV_PLC.diagnostic_audio import make_frontend, mel_phase_to_audio, fresh_stft, observed_stft
 
 DATASET = "grid"
 ARCH = "latent_spectral_v2"
@@ -106,6 +107,7 @@ def make_loader(args, gap_ms):
         test_subset=args.test_subset,
         temporal_jitter=False, jitter_p=1.0, jitter_max_frames=8,
         phase_reconstruction=True,
+        frontend_lookahead_ms=args.frontend_lookahead_ms,
     )
     return factory.test_dataloader(
         mask_range="10", seed=SEED,
@@ -117,25 +119,21 @@ def stats(loader):
     ds = loader.dataset
     while hasattr(ds, "dataset"):
         ds = ds.dataset
-    return float(getattr(ds, "mel_mean", -56.775)), float(getattr(ds, "mel_std", 19.707))
+    return float(ds.mel_mean), float(ds.mel_std)
 
 
 def unpack(batch, device):
-    if len(batch) != 12:
-        raise ValueError(
-            "Expected current phase-enabled AV batch with 12 elements; "
-            f"got {len(batch)}."
-        )
-    (visual, spk, masked, spec, video_spec, phase, video_phase,
-     length, text, mask, path, avail) = batch
-    visual = visual.float().to(device)
-    spk = spk.float().to(device)
-    masked = masked.float().to(device)
-    spec = spec.float().to(device)
-    phase = phase.float().to(device)
-    length = length.long().to(device)
-    mask = mask.float().to(device)
-    return visual, spk, masked, spec, phase, length, text, mask, path
+    core, clean_audio, sample_mask, frame_valid, _soft_keep = split_waveform_aux(batch)
+    if len(core) != 14:
+        raise ValueError(f"Expected phase-enabled AV core batch with 14 elements; got {len(core)}")
+    (visual, spk, masked, spec, _video_spec, stft_mag, _video_mag, phase, _video_phase,
+     length, text, mask, path, _avail) = core
+    return (
+        visual.float().to(device), spk.float().to(device), masked.float().to(device),
+        spec.float().to(device), stft_mag.float().to(device), phase.float().to(device),
+        length.long().to(device), text, mask.float().to(device), path,
+        clean_audio.float(), sample_mask.float(), frame_valid.bool(),
+    )
 
 
 class Acc:
@@ -158,24 +156,29 @@ def signature(path, mask):
     return [f"{p}::{hashlib.sha256(m[i].tobytes()).hexdigest()[:16]}" for i, p in enumerate(path)]
 
 
-def metrics(spec, recon_mel, text, mask, path, mel_mean, mel_std, recon_audio=None):
+def metrics(spec, recon_mel, text, mask, path, mel_mean, mel_std,
+            clean_audio, sample_mask, audio_length, frame_valid, recon_audio=None):
     kwargs = dict(
-        original_batch=spec.detach().cpu(),
-        reconstructed_batch=recon_mel.detach().cpu(),
+        original_batch=spec.detach().cpu(), reconstructed_batch=recon_mel.detach().cpu(),
         texts=text, mask=mask.detach().cpu(), path=list(path),
         hifigan_vocoder=None, tokenizer=None, max_samples=spec.size(0),
         sample_rate=sample_rate, mel_mean=mel_mean, mel_std=mel_std,
         masked_input=False,
+        original_audio_batch=clean_audio.detach().cpu(),
+        sample_mask_batch=sample_mask.detach().cpu(),
+        audio_lengths=audio_length.detach().cpu(),
+        frame_valid_batch=frame_valid.detach().cpu(),
+        normalize_wer_text=True,
     )
     if recon_audio is not None:
         kwargs["reconstructed_audio_batch"] = recon_audio.detach().cpu()
     return calculate_batch_metrics(**kwargs)
 
 
-def forward_av(model, visual, spk, masked, length, mask, phase):
+def forward_av(model, visual, masked, length, mask, phase=None, stft_magnitude=None):
     avail = torch.tensor([True, True], dtype=torch.bool, device=masked.device)
     avail = avail.unsqueeze(0).repeat(masked.size(0), 1)
-    out = model(masked, visual, spk, length, avail=avail, audio_mask=mask, phase=phase)
+    out = model(masked, visual, None, length, avail=avail, audio_mask=mask, phase=phase, stft_magnitude=stft_magnitude)
     if not isinstance(out, (tuple, list)) or len(out) != 4:
         raise RuntimeError("Expected latent_spectral_v2 AV_PLC to return 4 outputs.")
     completion = out[3]
@@ -194,47 +197,31 @@ def gt_phase_only_in_gap(final_cos, final_sin, gt_phase, mel_mask):
     )
 
 
-def true_stft_roundtrip(path, mask, stored_phase, device):
-    """Condition E and two sanity checks: iSTFT round trip + stored phase match."""
-    pad = (n_fft - hop_len) // 2  # 176
-    window = torch.hann_window(win_len, periodic=True, dtype=torch.float32, device=device)
-    audio_batch = []
-    rmses, snrs, maxerrs, phase_maes = [], [], [], []
-
-    for i, p in enumerate(path):
-        original, _ = read_gt_input(str(p), mask[i])
-        wav = torch.as_tensor(original, dtype=torch.float32, device=device)
-        stft = torch.stft(
-            F.pad(wav, (pad, pad)),
-            n_fft=n_fft, hop_length=hop_len, win_length=win_len,
-            window=window, center=False, normalized=False,
-            onesided=True, return_complex=True,
-        )
-        if stft.shape != stored_phase[i].shape:
-            raise RuntimeError(
-                f"Stored phase mismatch for {p}: STFT {tuple(stft.shape)} vs "
-                f"phase {tuple(stored_phase[i].shape)}"
-            )
-
-        mag, ph = stft.abs(), torch.angle(stft)
-        exact_complex = torch.complex(mag * torch.cos(ph), mag * torch.sin(ph))
-        rt = _manual_istft_center_false(exact_complex, crop_padding=True)
-        n = min(wav.numel(), rt.numel())
-        err = rt[:n] - wav[:n]
+def true_stft_roundtrip(clean_audio, audio_length, stored_mag, stored_phase, frontend, device):
+    """Validate HDF5 waveform <-> active configurable STFT geometry."""
+    wav = clean_audio.to(device=device, dtype=torch.float32)
+    fresh = fresh_stft(wav, frontend, device=device)
+    if tuple(fresh.shape) != tuple(stored_phase.shape):
+        raise RuntimeError(f"Fresh STFT {tuple(fresh.shape)} != stored phase {tuple(stored_phase.shape)}")
+    dphi = stored_phase.to(device) - torch.angle(fresh)
+    dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
+    phase_mae = dphi.abs().mean(dim=(1, 2))
+    mag_mae = (stored_mag.to(device) - fresh.abs()).abs().mean(dim=(1, 2))
+    exact = torch.polar(stored_mag.to(device), stored_phase.to(device))
+    rt = frontend.istft(exact, length=wav.size(-1))
+    rmses=[]; snrs=[]; maxerrs=[]
+    for i in range(wav.size(0)):
+        n=max(1, min(int(audio_length[i]), wav.size(-1), rt.size(-1)))
+        err=rt[i,:n]-wav[i,:n]
         rmses.append(torch.sqrt(err.square().mean()).item())
-        snrs.append((10 * torch.log10(wav[:n].square().sum() / err.square().sum().clamp_min(1e-20))).item())
+        snrs.append((10*torch.log10(wav[i,:n].square().sum().clamp_min(1e-20)/err.square().sum().clamp_min(1e-20))).item())
         maxerrs.append(err.abs().max().item())
-
-        dphi = stored_phase[i].to(device) - ph
-        dphi = torch.atan2(torch.sin(dphi), torch.cos(dphi))
-        phase_maes.append(dphi.abs().mean().item())
-        audio_batch.append(rt)
-
-    return torch.stack(audio_batch), {
+    return rt, {
         "roundtrip_rmse": float(np.mean(rmses)),
         "roundtrip_snr_db": float(np.mean(snrs)),
         "roundtrip_max_abs_error": float(np.max(maxerrs)),
-        "stored_phase_circular_mae_rad": float(np.mean(phase_maes)),
+        "stored_phase_circular_mae_rad": float(phase_mae.mean().item()),
+        "stored_magnitude_mae": float(mag_mae.mean().item()),
     }
 
 
@@ -242,6 +229,7 @@ def true_stft_roundtrip(path, mask, stored_phase, device):
 def run_oracles(args, gap, device):
     loader = make_loader(args, gap)
     mel_mean, mel_std = stats(loader)
+    frontend = make_frontend(mel_mean, mel_std, args.frontend_lookahead_ms)
     D, E = Acc(), Acc()
     sig = []
     diag_sum = defaultdict(float)
@@ -249,20 +237,19 @@ def run_oracles(args, gap, device):
     diag_max = 0.0
 
     for batch in loader:
-        visual, spk, masked, spec, phase, length, text, mask, path = unpack(batch, device)
+        visual, spk, masked, spec, stft_mag, phase, length, text, mask, path, clean_audio, sample_mask, frame_valid = unpack(batch, device)
         sig += signature(path, mask)
         bs = spec.size(0)
 
         # D: GT Mel + GT stored phase through the learned-phase reconstruction path.
-        d_audio = torch_melphase2audio(
-            spec, torch.cos(phase), torch.sin(phase),
-            mel_mean=mel_mean, mel_std=mel_std,
+        d_audio = mel_phase_to_audio(
+            spec, torch.cos(phase), torch.sin(phase), frontend, output_length=clean_audio.size(-1)
         )
-        D.add(metrics(spec, spec, text, mask, path, mel_mean, mel_std, d_audio), bs)
+        D.add(metrics(spec, spec, text, mask, path, mel_mean, mel_std, clean_audio, sample_mask, length, frame_valid, d_audio), bs)
 
         # E: exact STFT complex spectrum -> same manual inverse.
-        e_audio, diag = true_stft_roundtrip(path, mask, phase, device)
-        E.add(metrics(spec, spec, text, mask, path, mel_mean, mel_std, e_audio), bs)
+        e_audio, diag = true_stft_roundtrip(clean_audio, length, stft_mag, phase, frontend, device)
+        E.add(metrics(spec, spec, text, mask, path, mel_mean, mel_std, clean_audio, sample_mask, length, frame_valid, e_audio), bs)
         for k in ("roundtrip_rmse", "roundtrip_snr_db", "stored_phase_circular_mae_rad"):
             diag_sum[k] += diag[k] * bs
         diag_max = max(diag_max, diag["roundtrip_max_abs_error"])
@@ -279,14 +266,14 @@ def run_A(args, gap, device, model, ref_sig):
     mel_mean, mel_std = stats(loader)
     A, sig = Acc(), []
     for batch in loader:
-        visual, spk, masked, spec, phase, length, text, mask, path = unpack(batch, device)
+        visual, spk, masked, spec, stft_mag, phase, length, text, mask, path, clean_audio, sample_mask, frame_valid = unpack(batch, device)
         sig += signature(path, mask)
-        c = forward_av(model, visual, spk, masked, length, mask, phase=None)
+        c = forward_av(model, visual, masked, length, mask, phase=None)
         # A matches the CURRENT no-phase evaluator: raw predicted_mel is sent to
         # Griffin-Lim, and calculate_batch_metrics uses the gap mask for PLC scoring.
         # Do not use A's MSE/PSNR for the completed-Mel comparison; the user plans
         # to fix those separately with M_completed.
-        A.add(metrics(spec, c["predicted_mel"], text, mask, path, mel_mean, mel_std), spec.size(0))
+        A.add(metrics(spec, c["predicted_mel"], text, mask, path, mel_mean, mel_std, clean_audio, sample_mask, length, frame_valid), spec.size(0))
     if sig != ref_sig:
         raise RuntimeError("A pass did not use exactly the same samples/masks as oracle pass.")
     return A.result()
@@ -296,33 +283,34 @@ def run_A(args, gap, device, model, ref_sig):
 def run_A2_B_C(args, gap, device, model, ref_sig):
     loader = make_loader(args, gap)
     mel_mean, mel_std = stats(loader)
+    frontend = make_frontend(mel_mean, mel_std, args.frontend_lookahead_ms)
     A2, B, C, sig = Acc(), Acc(), Acc(), []
 
     for batch in loader:
-        visual, spk, masked, spec, phase, length, text, mask, path = unpack(batch, device)
+        visual, spk, masked, spec, stft_mag, phase, length, text, mask, path, clean_audio, sample_mask, frame_valid = unpack(batch, device)
         sig += signature(path, mask)
         bs = spec.size(0)
-        c = forward_av(model, visual, spk, masked, length, mask, phase=phase)
+        obs = observed_stft(clean_audio, sample_mask, frontend, device)
+        c = forward_av(
+            model, visual, masked, length, mask,
+            phase=torch.angle(obs), stft_magnitude=obs.abs(),
+        )
         mel = c["completed_mel"]
         final_cos, final_sin = c.get("final_cos"), c.get("final_sin")
         if final_cos is None or final_sin is None:
             raise RuntimeError("Phase model did not return final_cos/final_sin.")
 
         # A2: exact same phase-model Mel as B/C, but Griffin-Lim.
-        A2.add(metrics(spec, mel, text, mask, path, mel_mean, mel_std), bs)
+        A2.add(metrics(spec, mel, text, mask, path, mel_mean, mel_std, clean_audio, sample_mask, length, frame_valid), bs)
 
         # B: learned phase.
-        b_audio = torch_melphase2audio(
-            mel, final_cos, final_sin, mel_mean=mel_mean, mel_std=mel_std
-        )
-        B.add(metrics(spec, mel, text, mask, path, mel_mean, mel_std, b_audio), bs)
+        b_audio = mel_phase_to_audio(mel, final_cos, final_sin, frontend, output_length=clean_audio.size(-1))
+        B.add(metrics(spec, mel, text, mask, path, mel_mean, mel_std, clean_audio, sample_mask, length, frame_valid, b_audio), bs)
 
         # C: same Mel; replace only missing phase frames with stored GT phase.
         c_cos, c_sin = gt_phase_only_in_gap(final_cos, final_sin, phase, mask)
-        c_audio = torch_melphase2audio(
-            mel, c_cos, c_sin, mel_mean=mel_mean, mel_std=mel_std
-        )
-        C.add(metrics(spec, mel, text, mask, path, mel_mean, mel_std, c_audio), bs)
+        c_audio = mel_phase_to_audio(mel, c_cos, c_sin, frontend, output_length=clean_audio.size(-1))
+        C.add(metrics(spec, mel, text, mask, path, mel_mean, mel_std, clean_audio, sample_mask, length, frame_valid, c_audio), bs)
 
     if sig != ref_sig:
         raise RuntimeError("Phase pass did not use exactly the same samples/masks as oracle pass.")
@@ -365,6 +353,7 @@ def main():
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--checkpoint-root", default=None)
     ap.add_argument("--output-dir", default=None)
+    ap.add_argument("--frontend-lookahead-ms", type=float, default=7.5)
     args = ap.parse_args()
 
     set_global_seed(SEED)

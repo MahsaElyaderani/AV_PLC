@@ -214,6 +214,10 @@ def process_single_chunk_frames_sizes(chunk_file, keep_channel_dim=True, min_val
                 continue
 
             T0, H0, W0, C0 = arr.shape
+            if (H0, W0) == (96, 96):
+                # New AV_PLC aligned frames are already in their canonical
+                # stored geometry.  Never turn them back into legacy 112x112.
+                continue
             # Identify non-zero frames across all pixels/channels
             valid_mask = np.any(arr != 0, axis=(1, 2, 3))
             arr_valid = arr[valid_mask]  # (T_valid, H0, W0, 1)
@@ -418,10 +422,11 @@ def process_single_chunk_text(chunk_file: str, dataset_base: str = DATASET_BASE,
             valid_sec = float(audio_len) / SR if audio_len is not None else None
 
             try:
+                chunk_duration = min(max_sec, valid_sec) if valid_sec is not None else max_sec
                 transcript, _ = tokenizer.read_transcripts_for_chunk(
-                    txt_path, max_sec=max_sec
+                    txt_path, start_sec=0.0, max_sec=chunk_duration
                 )
-                encoded = tokenizer.encode(transcript, max_length=128)
+                encoded, _ = tokenizer.encode(transcript, max_length=128)
 
                 ds_key = f"{video_key}/text"
                 if ds_key in h5f:
@@ -641,7 +646,7 @@ def process_single_chunk_phone_indices(
                     skipped += 1
                     continue
 
-                phone_indices = phoneme_encoder.encode(
+                phone_indices, _, _ = phoneme_encoder.encode(
                     transcript,
                     max_length=max_phone_length,
                 )

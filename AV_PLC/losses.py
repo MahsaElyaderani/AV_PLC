@@ -78,13 +78,17 @@ class WhisperASRLoss(nn.Module):
         detach_gt: encode GT under no_grad to save memory (recommended)
     """
 
-    def __init__(self, model_size= "base", device="cuda" if torch.cuda.is_available() else "cpu",):
-
+    def __init__(self, model_size="base",
+                 device="cuda" if torch.cuda.is_available() else "cpu",
+                 mel_mean: float | None = None, mel_std: float | None = None):
         super().__init__()
-
+        if mel_mean is None or mel_std is None:
+            raise ValueError("WhisperASRLoss requires the active AV_PLC mel_mean/mel_std")
         self.n_mels = 80
-        self.target_frames = 3000  # 30s @ 100 fps
+        self.target_frames = 3000  # 30 s @ 100 Hz
         self.device = device
+        self.mel_mean = float(mel_mean)
+        self.mel_std = float(mel_std)
 
         self.whisper = whisper.load_model(model_size, device="cpu")
         self.whisper.eval()
@@ -93,31 +97,18 @@ class WhisperASRLoss(nn.Module):
             p.requires_grad = False  # freeze params; grads still flow to inputs
 
     def _to_whisper_mel(self, mel_norm: torch.Tensor) -> torch.Tensor:
+        """Convert AV_PLC normalized fixed-log Mel to Whisper's log-Mel scale.
+
+        AV_PLC stores 20*log10(magnitude-Mel) and z-scores it with one fixed
+        clean-training mean/std per dataset.  Undo that z-score here, convert
+        dB to log10-power units, then apply Whisper's relative 8-decade clamp
+        and final affine transform.  No legacy top_db or hard-coded dataset
+        statistics are used.
         """
-        Map our stored mel-norm to Whisper's input distribution.
-
-        Dataset pipeline (save_features.py):
-            MelSpectrogram(n_fft=512, win=400, hop=160, power=1.0, n_mels=80, slaney)
-            -> clamp(1e-5) -> AmplitudeToDB(stype='magnitude', top_db=80)
-            -> z-score with mu=-56.775, sigma=19.707
-            Note: 20*log10(|M|) == 10*log10(power), so mel_db is dB-of-power.
-
-        Whisper pipeline (whisper/audio.py):
-            log10(power).clamp_to_max_minus_8_of_max()
-            -> (log_spec + 4) / 4
-        """
-        # 1) undo our z-score -> 10*log10(power) in dB, i.e. same as Whisper's dB
-        mel_db = mel_norm * 19.707 - 56.775  # approx [-80, 0] (per top_db=80)
-
-        # 2) dB -> log10(power): Whisper's domain
-        log10_p = mel_db / 10.0  # approx [-8, 0]
-
-        # 3) Whisper's relative 80-dB clamp (idempotent for GT because top_db=80 was
-        #    already applied; meaningful for predicted mels which bypass that clamp)
+        mel_db = mel_norm * self.mel_std + self.mel_mean
+        log10_p = mel_db / 10.0
         log10_max = log10_p.amax(dim=(-2, -1), keepdim=True).detach()
         log10_p = torch.maximum(log10_p, log10_max - 8.0)
-
-        # 4) Whisper's canonical final affine -> typical range [-1, 1]
         return (log10_p + 4.0) / 4.0
 
     def _preprocess(self, mel: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -310,37 +301,37 @@ class MagnitudeReconstructionLoss(nn.Module):
 
 def istft_overlap_add(complex_spec: torch.Tensor, n_fft: int = 512,
                   win_length: int = 400, hop_length: int = 160,
-                  pad: int = 176, eps: float = 1e-8) -> torch.Tensor:
-    """Differentiable overlap-add iSTFT matching AV_PLC's current STFT geometry.
+                  pad: int = 176, eps: float = 1e-8,
+                  left_pad: int | None = None,
+                  output_length: int | None = None) -> torch.Tensor:
+    """Differentiable WOLA inverse for the AV_PLC STFT.
 
-    PyTorch's ``istft(center=False)`` can reject zero-ended Hann coverage at the
-    padded boundaries.  The dataset intentionally pads 176 samples at both ends,
-    so we perform explicit overlap-add and crop those padding samples afterward.
+    ``pad`` preserves the old symmetric 176/176 behavior.  The new frontend
+    supplies ``left_pad`` and ``output_length`` so arbitrary lookahead uses the
+    exact matching time origin.
     """
     if complex_spec.dim() != 3:
         raise ValueError(f"complex_spec must be [B,F,T], got {tuple(complex_spec.shape)}")
     if complex_spec.size(1) != n_fft // 2 + 1:
         raise ValueError(f"Expected {n_fft // 2 + 1} frequency bins")
 
-    b, _, t = complex_spec.shape
-    frames = torch.fft.irfft(complex_spec.transpose(1, 2), n=n_fft, dim=-1)  # [B,T,N]
-
+    frames = torch.fft.irfft(complex_spec.transpose(1, 2), n=n_fft, dim=-1)
     win = torch.hann_window(win_length, periodic=True, device=frames.device, dtype=frames.dtype)
-    left = (n_fft - win_length) // 2
-    right = n_fft - win_length - left
-    win = torch.nn.functional.pad(win, (left, right))
+    side = (n_fft - win_length) // 2
+    win = torch.nn.functional.pad(win, (side, n_fft - win_length - side))
 
-    out_len = n_fft + hop_length * (t - 1)
-    output = frames.new_zeros((b, out_len))
+    out_len = n_fft + hop_length * (frames.size(1) - 1)
+    output = frames.new_zeros((frames.size(0), out_len))
     denom = frames.new_zeros((out_len,))
     win_sq = win.square()
-
-    for i in range(t):
+    for i in range(frames.size(1)):
         start = i * hop_length
-        output[:, start:start + n_fft] = output[:, start:start + n_fft] + frames[:, i, :] * win
+        output[:, start:start + n_fft] = output[:, start:start + n_fft] + frames[:, i] * win
         denom[start:start + n_fft] = denom[start:start + n_fft] + win_sq
-
     output = output / denom.clamp_min(eps).unsqueeze(0)
+
+    if left_pad is not None and output_length is not None:
+        return output[:, int(left_pad):int(left_pad) + int(output_length)]
     if pad > 0:
         if output.size(-1) <= 2 * pad:
             raise ValueError("iSTFT output is shorter than requested boundary crop")
@@ -349,30 +340,43 @@ def istft_overlap_add(complex_spec: torch.Tensor, n_fft: int = 512,
 
 
 class WaveformReconstructionLoss(nn.Module):
-    """Waveform L1 after differentiable magnitude+phase synthesis."""
+    """Waveform L1 using the same configurable STFT time origin as AV_PLC."""
 
     def __init__(self, n_fft: int = 512, win_length: int = 400,
-                 hop_length: int = 160, pad: int = 176, eps: float = 1e-8):
+                 hop_length: int = 160, sample_rate: int = 16000,
+                 lookahead_ms: float = 7.5, output_length: int = 48000,
+                 eps: float = 1e-8):
         super().__init__()
         self.n_fft = int(n_fft)
         self.win_length = int(win_length)
         self.hop_length = int(hop_length)
-        self.pad = int(pad)
+        self.output_length = int(output_length)
         self.eps = float(eps)
+        L = int(round(float(lookahead_ms) * sample_rate / 1000.0))
+        side = (self.n_fft - self.win_length) // 2
+        self.left_pad = self.win_length - self.hop_length - L + side
 
-    def forward(self, pred_mag, pred_cos, pred_sin, target_mag, target_phase):
+    def forward(self, pred_mag, pred_cos, pred_sin, target_mag, target_phase,
+                audio_lengths=None):
         target_mag = target_mag.to(device=pred_mag.device, dtype=pred_mag.dtype)
         target_phase = target_phase.to(device=pred_mag.device, dtype=pred_mag.dtype)
         pred_complex = torch.complex(pred_mag * pred_cos, pred_mag * pred_sin)
         target_complex = torch.polar(target_mag, target_phase)
-
         pred_wav = istft_overlap_add(
-            pred_complex, self.n_fft, self.win_length, self.hop_length, self.pad, self.eps
+            pred_complex, self.n_fft, self.win_length, self.hop_length,
+            pad=0, eps=self.eps, left_pad=self.left_pad, output_length=self.output_length,
         )
         target_wav = istft_overlap_add(
-            target_complex, self.n_fft, self.win_length, self.hop_length, self.pad, self.eps
+            target_complex, self.n_fft, self.win_length, self.hop_length,
+            pad=0, eps=self.eps, left_pad=self.left_pad, output_length=self.output_length,
         )
-        return torch.nn.functional.l1_loss(pred_wav, target_wav)
+        diff = (pred_wav - target_wav).abs()
+        if audio_lengths is None:
+            return diff.mean()
+        lengths = audio_lengths.to(device=diff.device, dtype=torch.long).reshape(-1)
+        valid = torch.arange(diff.size(1), device=diff.device)[None, :] < lengths[:, None]
+        return (diff * valid).sum() / valid.sum().clamp_min(1)
+
 
 # MP-SENet-style anti-wrapping phase losses used by the new parallel M/P stage.
 def anti_wrapping_error(delta: torch.Tensor) -> torch.Tensor:
