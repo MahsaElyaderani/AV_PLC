@@ -19,23 +19,14 @@ from evaluations.result_utils import save_combined_results
 def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss_rates,
                         mask_types=("gilbert",), gap_durations=(), save_output=False,
                         sample_paths=None, phase_reconstruction=False,
-                        completion_mel_loss=True, w_completion_mel=1.0,
-                        phase_unit_loss=True,
+                        phase_refine_loss=True, phase_unit_loss=True,
                         phase_temporal_loss=True, phase_frequency_loss=True,
-                        phase_complex_loss=True, phase_init_checkpoint=None,
-                        w_phase_unit=0.10,
-                        w_phase_temporal=0.05, w_phase_frequency=0.05,
-                        w_phase_complex=0.10):
+                        phase_init_checkpoint=None,
+                        w_phase_refine=0.10, w_phase_unit=0.10,
+                        w_phase_temporal=0.05, w_phase_frequency=0.05):
     set_global_seed(SEED)
     if phase_reconstruction and mode != "av":
-        raise ValueError("Learned phase reconstruction is implemented in AV_PLC; use --mode av.")
-    if phase_init_checkpoint is not None:
-        raise ValueError(
-            "--phase-init-checkpoint is incompatible with the latent-only decoder. "
-            "Train a fresh latent_spectral_v2 checkpoint instead."
-        )
-
-    use_phase_complex_loss = bool(phase_reconstruction and phase_complex_loss)
+        raise ValueError("The shared phase-completion head is implemented in AV_PLC; use --mode av.")
 
     batch_size = 16
     num_epochs = 100
@@ -62,9 +53,7 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
                   f"{'_pesq_0.01' if pesq_flag else ''}"
                   f"{'_stoi_0.01' if stoi_flag else ''}"
                   f"{'_asr_0.1' if asr_flag else ''}"
-                  f"_latent_spectral_v2"
                   f"{'_phase_recon' if phase_reconstruction else ''}"
-                  f"{'_complex_v1' if use_phase_complex_loss else ''}"
                   f"({dataset_name})")
     logger = setup_logging(model_name, log_dir)
     logger.info(f"Using device: {device}; Fusion: {fusion_name}")
@@ -90,6 +79,19 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             audio_ckpt_path=None, #"/home/ai/Projects/Mahsa/sources/AV_PLC/checkpoints/audio_plc_pesq_0.01(grid)/best_model.pt",
             freeze_audio_enc=False,
             phase_reconstruction=phase_reconstruction,).to(device)
+
+    if phase_reconstruction and phase_init_checkpoint:
+        ckpt = torch.load(phase_init_checkpoint, map_location="cpu", weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt.get("model_state", ckpt))
+        incompatible = model.load_state_dict(state, strict=False)
+        bad_missing = [k for k in incompatible.missing_keys
+                       if not (k.startswith("spectral_completion.") or k.startswith("spectral_temporal."))]
+        if bad_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"Phase initialization mismatch: missing={bad_missing}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+        logger.info("Initialized legacy AV_PLC weights from %s", phase_init_checkpoint)
 
     logger.info(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
 
@@ -124,16 +126,14 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             cosine_Tmax=num_epochs,
             early_stop_patience=None,
             phase_reconstruction=phase_reconstruction,
-            completion_mel_loss=completion_mel_loss,
-            w_completion_mel=w_completion_mel,
+            phase_refine_loss=phase_refine_loss,
             phase_unit_loss=phase_unit_loss,
             phase_temporal_loss=phase_temporal_loss,
             phase_frequency_loss=phase_frequency_loss,
-            phase_complex_loss=use_phase_complex_loss,
+            w_phase_refine=w_phase_refine,
             w_phase_unit=w_phase_unit,
             w_phase_temporal=w_phase_temporal,
             w_phase_frequency=w_phase_frequency,
-            w_phase_complex=w_phase_complex,
         )
 
         start_epoch = trainer.load_checkpoint(load_best=True)
@@ -174,16 +174,14 @@ def av_conformer_runner(mode, phase, dataset_name, asr_flag, pesq_flag, plc_loss
             cosine_Tmax=num_epochs,
             early_stop_patience=None,
             phase_reconstruction=phase_reconstruction,
-            completion_mel_loss=completion_mel_loss,
-            w_completion_mel=w_completion_mel,
+            phase_refine_loss=phase_refine_loss,
             phase_unit_loss=phase_unit_loss,
             phase_temporal_loss=phase_temporal_loss,
             phase_frequency_loss=phase_frequency_loss,
-            phase_complex_loss=use_phase_complex_loss,
+            w_phase_refine=w_phase_refine,
             w_phase_unit=w_phase_unit,
             w_phase_temporal=w_phase_temporal,
             w_phase_frequency=w_phase_frequency,
-            w_phase_complex=w_phase_complex,
         )
         trainer.load_checkpoint(os.path.join(checkpoint_dir, model_name, "best_model.pt"))
 
@@ -258,23 +256,17 @@ if __name__ == "__main__":
                         help="Optional dataset-relative or absolute video paths to save. "
                              "If omitted, save all test utterances.")
     parser.add_argument("--phase-reconstruction", action="store_true",
-                        help="Jointly condition the latent spectral decoder on observed phase and predict phase.")
+                        help="Enable the optional shared post-Mel phase-completion head.")
     parser.add_argument("--phase-init-checkpoint", type=str, default=None,
-                        help="Deprecated/incompatible with latent_spectral_v2; kept only to fail clearly.")
-    parser.add_argument("--w-completion-mel", type=float, default=1.0,
-                        help="Weight of masked absolute log-Mel reconstruction (always active in AV mode).")
+                        help="Optional legacy AV_PLC checkpoint used to initialize non-phase weights.")
+    parser.add_argument("--no-phase-refine-loss", action="store_true")
     parser.add_argument("--no-phase-unit-loss", action="store_true")
     parser.add_argument("--no-phase-temporal-loss", action="store_true")
     parser.add_argument("--no-phase-frequency-loss", action="store_true")
-    parser.add_argument(
-        "--no-phase-complex-loss", action="store_true",
-        help=("Disable projected complex-spectrum consistency. By default it is "
-              "enabled whenever --phase-reconstruction is active."),
-    )
+    parser.add_argument("--w-phase-refine", type=float, default=0.10)
     parser.add_argument("--w-phase-unit", type=float, default=0.10)
     parser.add_argument("--w-phase-temporal", type=float, default=0.05)
     parser.add_argument("--w-phase-frequency", type=float, default=0.05)
-    parser.add_argument("--w-phase-complex", type=float, default=0.10)
     args = parser.parse_args()
 
     av_conformer_runner(mode=args.mode, phase=args.phase,
@@ -283,14 +275,12 @@ if __name__ == "__main__":
                    gap_durations=args.gap_durations, save_output=args.save_output,
                    sample_paths=args.sample_paths,
                    phase_reconstruction=args.phase_reconstruction,
-                   completion_mel_loss=True,
-                   w_completion_mel=args.w_completion_mel,
+                   phase_refine_loss=not args.no_phase_refine_loss,
                    phase_unit_loss=not args.no_phase_unit_loss,
                    phase_temporal_loss=not args.no_phase_temporal_loss,
                    phase_frequency_loss=not args.no_phase_frequency_loss,
-                   phase_complex_loss=not args.no_phase_complex_loss,
                    phase_init_checkpoint=args.phase_init_checkpoint,
+                   w_phase_refine=args.w_phase_refine,
                    w_phase_unit=args.w_phase_unit,
                    w_phase_temporal=args.w_phase_temporal,
-                   w_phase_frequency=args.w_phase_frequency,
-                   w_phase_complex=args.w_phase_complex)
+                   w_phase_frequency=args.w_phase_frequency)

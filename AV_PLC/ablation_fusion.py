@@ -1,14 +1,13 @@
-"""AV-PLC fusion ablation with a protected Mel path and optional parallel_mp_v1.
+"""
+Current-architecture AV-PLC fusion ablation, with optional phase reconstruction.
 
-No-phase runs preserve the existing latent_spectral_v2 experiment: historical
-concat weights donate only the audio/video encoders, which stay frozen while a
-method-specific fusion + latent-to-Mel decoder is trained.
-
-Parallel_mp_v1 runs are deliberately different: each method loads its *complete*
-trained no-phase checkpoint, freezes every inherited parameter, and trains only
-``phase_completion.*``. The new module receives inverse-Mel magnitude with exact
-observed magnitude copied outside gaps plus masked phase cosine/sine, then predicts
-magnitude and phase in parallel with magnitude, IP/GD/IAF, complex and waveform losses.
+Important checkpoint policy:
+  * Historical fusion-ablation checkpoints are never loaded as full models.
+  * The historical concat checkpoint is used only as an audio/video encoder donor.
+  * No-phase concat/TSCA/GLA baselines are trained with the current shared-decoder
+    architecture and saved under ARCH_VERSION-specific names.
+  * Phase runs load the corresponding current no-phase baseline, freeze it, and
+    train only the optional shared spectral-completion modules.
 
 Evaluation uses deterministic single gaps of 160, 500, and 1000 ms by default.
 """
@@ -39,12 +38,7 @@ if _ROOT is None:
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from evaluations.runtime_config import (
-    SEED,
-    project_checkpoint_dir,
-    project_log_dir,
-    set_global_seed,
-)
+from evaluations.runtime_config import SEED, project_checkpoint_dir, project_log_dir, set_global_seed
 from AV_PLC.av_dataloader import AVDataloader
 from AV_PLC.multimodal_decoder import AV_PLC
 from AV_PLC.trainer import Trainer
@@ -52,14 +46,8 @@ from AV_PLC.trainer import Trainer
 
 REPRESENTATIVE_GAPS_MS = [160, 500, 1000]
 JITTER_MAX_FRAMES = 8
-ARCH_VERSION = "latent_spectral_v2"  # Existing Mel architecture/checkpoint namespace.
-PHASE_ARCH_VERSION = "parallel_mp_v1"
-ABLATION_METHODS = (
-    "concat",
-    "temporal_self_cross_attention",
-    "global_local_affinity",
-)
-
+ARCH_VERSION = "shared_decoder_v1"  # Bump this whenever the model architecture changes.
+ABLATION_METHODS = ("concat", "temporal_self_cross_attention", "global_local_affinity",)
 PLOT_METRICS = {
     "mse": "MSE (↓)",
     "psnr": "PSNR (dB, ↑)",
@@ -71,71 +59,38 @@ PLOT_METRICS = {
     "plcmos": "PLCMOS (↑)",
 }
 
-ENCODER_ARGS = dict(
-    mel_dim=80,
-    feat_dim=256,
-    dropout=0.1,
-    video_depth=6,
-    video_heads=4,
-    video_hidden_size=256,
-    audio_depth=4,
-    audio_heads=4,
-    audio_hidden_size=256,
-    audio_ckpt_path=None,
-    freeze_audio_enc=False,
-)
-
+ENCODER_ARGS = dict(mel_dim=80, feat_dim=256, dropout=0.1,
+                    video_depth=6, video_heads=4, video_hidden_size=256,
+                    audio_depth=4, audio_heads=4, audio_hidden_size=256,
+                    audio_ckpt_path=None, freeze_audio_enc=False,)
 
 def concat_model_name(dataset: str) -> str:
     """Historical concat checkpoint used only to initialize audio/video encoders."""
-    return (
-        "av_wide_masking_mlp_av_only_fusion_5loss_bursty_l1_only_enc_loss"
-        f"({dataset})"
-    )
+    return (f"av_wide_masking_mlp_av_only_fusion_5loss_bursty_l1_only_enc_loss({dataset})")
 
 def experiment_suffix(temporal_jitter: bool) -> str:
     """Condition suffix shared by checkpoints, logs, CSVs, and plots."""
     return f"_jitter{JITTER_MAX_FRAMES}" if temporal_jitter else "_no_jitter"
 
-
-def experiment_name(temporal_jitter: bool, phase_reconstruction: bool = False,
-                    phase_complex_loss: bool = False) -> str:
-    # phase_complex_loss is retained only for old plotting-call compatibility.
+def experiment_name(temporal_jitter: bool, phase_reconstruction: bool = False) -> str:
     name = f"ablation_fusion_{ARCH_VERSION}{experiment_suffix(temporal_jitter)}"
-    return name + (f"_{PHASE_ARCH_VERSION}" if phase_reconstruction else "")
+    return name + ("_phase_reconstruction" if phase_reconstruction else "")
 
-
-def phase_model_name(base_model_name: str, phase_complex_loss: bool = False) -> str:
-    """Keep parallel_mp_v1 checkpoints separate from every previous phase variant."""
-    return f"{base_model_name}_{PHASE_ARCH_VERSION}"
-
+def phase_model_name(base_model_name: str) -> str:
+    """Keep learned-phase checkpoints separate from all existing fusion checkpoints."""
+    return f"{base_model_name}_phase_reconstruction"
 
 def frozen_concat_model_name(dataset: str, temporal_jitter: bool = False) -> str:
-    return (
-        f"av_plc_concat_{ARCH_VERSION}_frozen_enc_masked_mel_ge_train"
-        f"{experiment_suffix(temporal_jitter)}({dataset})"
-    )
+    return (f"av_plc_concat_{ARCH_VERSION}_frozen_enc_fused_l1_ge_train"
+            f"{experiment_suffix(temporal_jitter)}({dataset})")
 
+def frozen_temporal_self_cross_attention_model_name(dataset: str, temporal_jitter: bool = False,) -> str:
+    return (f"av_plc_temporal_self_cross_attention_{ARCH_VERSION}_frozen_enc_fused_l1_ge_train"
+            f"{experiment_suffix(temporal_jitter)}({dataset})")
 
-def frozen_temporal_self_cross_attention_model_name(
-    dataset: str,
-    temporal_jitter: bool = False,
-) -> str:
-    return (
-        f"av_plc_temporal_self_cross_attention_{ARCH_VERSION}_frozen_enc_masked_mel_ge_train"
-        f"{experiment_suffix(temporal_jitter)}({dataset})"
-    )
-
-
-def frozen_global_local_affinity_model_name(
-    dataset: str,
-    temporal_jitter: bool = False,
-) -> str:
-    return (
-        f"av_plc_global_local_affinity_{ARCH_VERSION}_frozen_enc_masked_mel_ge_train"
-        f"{experiment_suffix(temporal_jitter)}({dataset})"
-    )
-
+def frozen_global_local_affinity_model_name(dataset: str, temporal_jitter: bool = False,) -> str:
+    return (f"av_plc_global_local_affinity_{ARCH_VERSION}_frozen_enc_fused_l1_ge_train"
+            f"{experiment_suffix(temporal_jitter)}({dataset})")
 
 def configs(dataset: str, radius: int, args=None):
     temporal_jitter = bool(args and args.temporal_jitter)
@@ -152,17 +107,13 @@ def configs(dataset: str, radius: int, args=None):
             tag="temporal_self_cross_attention",
             fusion_type="temporal_self_cross_attention",
             freeze_encoders=True,
-            base_model_name=frozen_temporal_self_cross_attention_model_name(
-                dataset, temporal_jitter
-            ),
+            base_model_name=frozen_temporal_self_cross_attention_model_name(dataset, temporal_jitter),
         ),
         dict(
             tag="global_local_affinity",
             fusion_type="global_local_affinity",
             freeze_encoders=True,
-            base_model_name=frozen_global_local_affinity_model_name(
-                dataset, temporal_jitter
-            ),
+            base_model_name=frozen_global_local_affinity_model_name(dataset, temporal_jitter),
         ),
     ]
     for config in bases:
@@ -173,38 +124,38 @@ def configs(dataset: str, radius: int, args=None):
         )
     return bases
 
-
 def make_shared_encoder_state(args, checkpoint_dir):
     """Extract only audio_enc.* and video_enc.* from the historical concat checkpoint."""
     concat_name = args.concat_model_name or concat_model_name(args.dataset)
     checkpoint_path = os.path.join(checkpoint_dir, concat_name, "best_model.pt",)
     if not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(
-            "The historical concat checkpoint is required only as an encoder donor: "
-            f"{checkpoint_path}"
-        )
+        raise FileNotFoundError("The historical concat checkpoint is required only as an encoder donor: "
+                                f"{checkpoint_path}")
 
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-    full_state = checkpoint.get(
-        "model_state_dict",
-        checkpoint.get("model_state", checkpoint),
-    )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False,)
+    full_state = checkpoint.get("model_state_dict", checkpoint.get("model_state", checkpoint),)
     state = {
         key: value.detach().cpu().clone()
         for key, value in full_state.items()
         if key.startswith("audio_enc.") or key.startswith("video_enc.")
     }
     if not state:
-        raise RuntimeError(
-            f"No audio_enc.* or video_enc.* weights found in {checkpoint_path}."
-        )
+        raise RuntimeError(f"No audio_enc.* or video_enc.* weights found in {checkpoint_path}.")
     return state
 
-
+def make_shared_phase_state():
+    """Create one identical initialization for the new completion modules."""
+    set_global_seed(SEED)
+    reference = AV_PLC(**ENCODER_ARGS, fusion_type="concat", phase_reconstruction=True,)
+    state = {
+        key: value.detach().cpu().clone()
+        for key, value in reference.state_dict().items()
+        if key.startswith("spectral_completion.") or key.startswith("spectral_temporal.")
+    }
+    if not state:
+        raise RuntimeError("Failed to construct shared phase-completion initialization")
+    del reference
+    return state
 
 def state_hash(state) -> str:
     digest = hashlib.sha256()
@@ -214,49 +165,41 @@ def state_hash(state) -> str:
         digest.update(tensor.numpy().tobytes())
     return digest.hexdigest()
 
+def _load_current_baseline_checkpoint(model, config, checkpoint_dir):
+    """Load this script's current-architecture no-phase baseline into a phase model.
 
-def _load_full_no_phase_checkpoint(model, config, checkpoint_dir):
-    """Load the exact method-specific Mel model; only phase_completion may be missing."""
+    The phase-enabled model may be missing only the newly introduced phase modules.
+    Any other missing/unexpected key means the baseline is not compatible with the
+    current ARCH_VERSION and must be retrained with this script first.
+    """
     base_path = os.path.join(checkpoint_dir, config["base_model_name"], "best_model.pt")
     if not os.path.isfile(base_path):
-        raise FileNotFoundError(
-            "parallel_mp_v1 requires the corresponding trained no-phase checkpoint. "
-            f"Run this ablation without --phase-reconstruction first. Missing: {base_path}"
-        )
+        raise FileNotFoundError("Phase reconstruction requires the corresponding current no-phase "
+            f"baseline first. Run ablation_fusion.py without --phase-reconstruction. Missing: {base_path}")
     checkpoint = torch.load(base_path, map_location="cpu", weights_only=False)
-    state = checkpoint.get(
-        "model_state_dict", checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
-    )
+    state = checkpoint.get("model_state_dict", checkpoint.get("model_state", checkpoint))
     incompatible = model.load_state_dict(state, strict=False)
+    allowed_missing_prefixes = ("spectral_completion.", "spectral_temporal.")
     bad_missing = [
         key for key in incompatible.missing_keys
-        if not key.startswith("phase_completion.")
+        if not key.startswith(allowed_missing_prefixes)
     ]
     bad_unexpected = list(incompatible.unexpected_keys)
     if bad_missing or bad_unexpected:
         raise RuntimeError(
-            "No-phase checkpoint is not compatible with parallel_mp_v1: "
-            f"missing={bad_missing}, unexpected={bad_unexpected}"
+            "Current no-phase baseline is incompatible with the phase model. "
+            f"ARCH_VERSION={ARCH_VERSION}; missing={bad_missing}, unexpected={bad_unexpected}. "
+            "Retrain the no-phase baseline with the current ablation_fusion.py."
         )
     return base_path
 
-
-def build_model(config, shared_encoder_state, args, checkpoint_dir):
-    """Build either the existing Mel ablation or the new frozen-content parallel magnitude/phase experiment."""
+def build_model(config, shared_encoder_state, shared_phase_state, args, checkpoint_dir):
     set_global_seed(SEED)
 
-    model_kwargs = dict(
-        **ENCODER_ARGS,
-        fusion_type=config["fusion_type"],
-        phase_reconstruction=args.phase_reconstruction,
-        phase_channels=args.phase_channels,
-        phase_ts_blocks=args.phase_ts_blocks,
-        phase_ts_heads=args.phase_ts_heads,
-        phase_encoder_dense_depth=args.phase_encoder_dense_depth,
-        phase_refine_dense_depth=args.phase_refine_dense_depth,
-        phase_magnitude_compression=args.phase_mag_compression,
-    )
+    model_kwargs = dict(**ENCODER_ARGS, fusion_type=config["fusion_type"],
+                        phase_reconstruction=args.phase_reconstruction,)
 
+    # Keep the global-local affinity hyperparameters fixed in code.
     if config["fusion_type"] == "global_local_affinity":
         model_kwargs.update(
             affinity_dim=128,
@@ -271,16 +214,23 @@ def build_model(config, shared_encoder_state, args, checkpoint_dir):
     model = AV_PLC(**model_kwargs)
 
     if args.phase_reconstruction:
-        # Crucial control: reuse the complete successful Mel model and train only
-        # the new phase branch.  The phase branch was initialized before the
-        # fusion module, so its random initialization is identical across methods
-        # when set_global_seed(SEED) is called above.
-        base_path = _load_full_no_phase_checkpoint(model, config, checkpoint_dir)
+        # Load the corresponding current shared-decoder baseline, then train only
+        # the new spectral-completion modules. This isolates phase reconstruction.
+        _load_current_baseline_checkpoint(model, config, checkpoint_dir)
+        incompatible = model.load_state_dict(shared_phase_state, strict=False)
+        bad_phase_missing = [key for key in shared_phase_state if key in incompatible.missing_keys]
+        bad_phase_unexpected = [
+            key for key in incompatible.unexpected_keys
+            if key.startswith("spectral_completion.") or key.startswith("spectral_temporal.")
+        ]
+        if bad_phase_missing or bad_phase_unexpected:
+            raise RuntimeError("Shared phase initialization failed: "
+                f"missing={bad_phase_missing}, unexpected={bad_phase_unexpected}")
         for parameter in model.parameters():
             parameter.requires_grad = False
-        if model.phase_completion is None:
-            raise RuntimeError("parallel_mp_v1 model was constructed without phase_completion")
-        for parameter in model.phase_completion.parameters():
+        for parameter in model.spectral_completion.parameters():
+            parameter.requires_grad = True
+        for parameter in model.spectral_temporal.parameters():
             parameter.requires_grad = True
 
         original_train = model.train
@@ -288,21 +238,21 @@ def build_model(config, shared_encoder_state, args, checkpoint_dir):
         def train_phase_only(self, mode=True):
             original_train(mode)
             if mode:
+                # Keep the entire current no-phase AV-PLC deterministic/frozen.
                 self.audio_enc.eval()
                 self.video_enc.eval()
                 self.fusion.eval()
-                self.spectral_temporal.eval()
-                self.spectral_completion.eval()
-                self.phase_completion.train()
+                self.temporal.eval()
+                self.out.eval()
+                self.spectral_completion.train()
+                self.spectral_temporal.train()
             return self
 
         model.train = types.MethodType(train_phase_only, model)
-        model._phase_base_checkpoint = base_path
         return model
 
-    # Existing no-phase ablation behavior: reuse only historical encoders.
-    if shared_encoder_state is None:
-        raise ValueError("No-phase training requires shared_encoder_state")
+    # Current no-phase baseline: historical checkpoint contributes encoders only;
+    # fusion and the shared temporal decoder are freshly initialized here.
     incompatible = model.load_state_dict(shared_encoder_state, strict=False)
     bad_missing = [
         key for key in incompatible.missing_keys
@@ -339,16 +289,11 @@ def build_model(config, shared_encoder_state, args, checkpoint_dir):
 
     return model
 
-
-def _effective_batch_size(args):
-    return args.phase_batch_size if args.phase_reconstruction else args.batch_size
-
-
 def make_train_val_loaders(args):
     factory = AVDataloader(
         dataset_name=args.dataset,
         mode="av",
-        batch_size=_effective_batch_size(args),
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
         video_aug=True,
         dropout_modality=True,
@@ -366,7 +311,7 @@ def make_eval_factory(args):
     return AVDataloader(
         dataset_name=args.dataset,
         mode="av",
-        batch_size=_effective_batch_size(args),
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
         dropout_modality=False,
         test_subset=args.test_subset,
@@ -377,18 +322,19 @@ def make_eval_factory(args):
         phase_reconstruction=args.phase_reconstruction,
     )
 
-def build_trainer(config, args, shared_encoder_state, checkpoint_dir, log_dir):
+def build_trainer(config, args, shared_encoder_state, shared_phase_state, checkpoint_dir, log_dir):
+    # Rebuild the same data pipeline for every method.
     set_global_seed(SEED)
     train_loader, val_loader = make_train_val_loaders(args)
 
     trainer = Trainer(
-        model=build_model(config, shared_encoder_state, args, checkpoint_dir),
+        model=build_model(config, shared_encoder_state, shared_phase_state, args, checkpoint_dir),
         model_name=config["model_name"],
         mode="av",
         train_loader=train_loader,
         val_loader=val_loader,
         drop_av=True,
-        enc_loss=False,
+        enc_loss=True,
         sc_loss=False,
         ce_loss=False,
         pesq_loss=False,
@@ -406,23 +352,15 @@ def build_trainer(config, args, shared_encoder_state, checkpoint_dir, log_dir):
         betas=(0.9, 0.98),
         early_stop_patience=None,
         phase_reconstruction=args.phase_reconstruction,
-        completion_mel_loss=not args.phase_reconstruction,
-        w_completion_mel=1.0,
-        phase_unit_loss=(args.phase_reconstruction and not args.no_phase_unit_loss),
-        phase_temporal_loss=(args.phase_reconstruction and not args.no_phase_temporal_loss),
-        phase_frequency_loss=(args.phase_reconstruction and not args.no_phase_frequency_loss),
-        phase_complex_loss=args.phase_reconstruction,
-        magnitude_loss=args.phase_reconstruction,
-        waveform_loss=args.phase_reconstruction,
-        content_mel_losses=args.phase_reconstruction,
+        phase_refine_loss=not args.no_phase_refine_loss,
+        phase_unit_loss=not args.no_phase_unit_loss,
+        phase_temporal_loss=not args.no_phase_temporal_loss,
+        phase_frequency_loss=not args.no_phase_frequency_loss,
+        w_phase_refine=args.w_phase_refine,
         w_phase_unit=args.w_phase_unit,
         w_phase_temporal=args.w_phase_temporal,
         w_phase_frequency=args.w_phase_frequency,
-        w_phase_complex=args.w_complex,
-        w_magnitude=args.w_magnitude,
-        w_waveform=args.w_waveform,
         phase_losses_only=args.phase_reconstruction,
-        phase_only_training=args.phase_reconstruction,
     )
 
     assert not trainer.sc_loss
@@ -430,61 +368,34 @@ def build_trainer(config, args, shared_encoder_state, checkpoint_dir, log_dir):
     assert not trainer.pesq_loss
     assert not trainer.stoi_loss
     assert not trainer.asr_loss
-    if args.phase_reconstruction:
-        assert not trainer.completion_mel_loss
-        assert trainer.phase_complex_loss
-        assert trainer.magnitude_loss
-        assert trainer.waveform_loss
-        assert trainer.phase_losses_only
-        assert trainer.phase_only_training
     return trainer
 
-
-def save_manifest(trainer, config, args, encoder_sha):
-    phase_mode = bool(args.phase_reconstruction)
+def save_manifest(trainer, config, args, encoder_sha, phase_sha=None):
     manifest = {
-        "experiment": experiment_name(args.temporal_jitter, phase_mode, False),
+        "experiment": experiment_name(args.temporal_jitter, args.phase_reconstruction),
         "dataset": args.dataset,
-        "architecture_version": PHASE_ARCH_VERSION if phase_mode else ARCH_VERSION,
+        "architecture_version": ARCH_VERSION,
         "seed": SEED,
         "method": config,
         "pretrained_encoder_sha256": encoder_sha,
+        "shared_phase_initialization_sha256": phase_sha,
         "controlled_settings": {
             "encoders": ENCODER_ARGS,
             "encoder_source": (
-                getattr(trainer.model, "_phase_base_checkpoint", config["base_model_name"])
-                if phase_mode
-                else "historical concat checkpoint: audio_enc.* and video_enc.* only"
+                f"corresponding {ARCH_VERSION} no-phase best_model.pt"
+                if args.phase_reconstruction else "historical concat checkpoint: audio_enc.* and video_enc.* only"
             ),
-            "frozen_mel_model": phase_mode,
-            "phase_reconstruction": phase_mode,
-            "phase_architecture": (
-                {
-                    "channels": args.phase_channels,
-                    "ts_blocks": args.phase_ts_blocks,
-                    "ts_heads": args.phase_ts_heads,
-                    "encoder_dense_depth": args.phase_encoder_dense_depth,
-                    "refine_dense_depth": args.phase_refine_dense_depth,
-                    "magnitude_compression": args.phase_mag_compression,
-                    "input": "[completed linear magnitude, R*cos(phi), R*sin(phi)]",
-                }
-                if phase_mode else None
-            ),
+            "encoders_frozen": True,
+            "phase_reconstruction": args.phase_reconstruction,
             "phase_training": (
-                "full method-specific no-phase AV_PLC content backbone frozen; only parallel magnitude/phase phase_completion.* trainable"
-                if phase_mode
-                else "disabled; latent decoder predicts Mel and evaluation uses Griffin-Lim"
+                "new spectral-completion modules only; corresponding current no-phase model frozen; phase losses only drive optimization/checkpoint selection"
+                if args.phase_reconstruction else "disabled"
             ),
-            "loss_weights": {
-                "audio_mel_l1": 1.0 if phase_mode else 0.0,
-                "video_mel_l1": 1.0 if phase_mode else 0.0,
-                "fused_mel_l1": 1.0 if phase_mode else 0.0,
-                "magnitude": args.w_magnitude if phase_mode else 0.0,
-                "phase_ip": args.w_phase_unit if phase_mode else 0.0,
-                "phase_iaf": args.w_phase_temporal if phase_mode else 0.0,
-                "phase_gd": args.w_phase_frequency if phase_mode else 0.0,
-                "complex": args.w_complex if phase_mode else 0.0,
-                "waveform": args.w_waveform if phase_mode else 0.0,
+            "phase_loss_weights": {
+                "refine": args.w_phase_refine,
+                "unit": args.w_phase_unit,
+                "temporal": args.w_phase_temporal,
+                "frequency": args.w_phase_frequency,
             },
             "training_mask": "bursty GE; per-access loss rate uniform in [0.3, 0.9]",
             "validation_mask": "stable bursty GE; seed=SEED; range [0.3, 0.9]",
@@ -498,9 +409,10 @@ def save_manifest(trainer, config, args, encoder_sha):
             "jitter_probability_train_val": 0.5 if args.temporal_jitter else 0.0,
             "jitter_max_frames": JITTER_MAX_FRAMES if args.temporal_jitter else 0,
             "loss": (
-                "parallel M/P objective: Mel-head L1 + magnitude + IP/GD/IAF + complex + waveform; content backbone frozen"
-                if phase_mode
-                else "masked absolute log-Mel reconstruction only; pretrained encoders frozen"
+                "current baseline reconstruction plus optional Mel-refinement/unit-phase/"
+                "temporal-phase/frequency-phase losses; only completion modules train"
+                if args.phase_reconstruction
+                else "L1 only: fused reconstruction plus audio/video encoder auxiliary losses; pretrained encoders frozen"
             ),
             "optimizer": "AdamW",
             "learning_rate": args.learning_rate,
@@ -508,7 +420,7 @@ def save_manifest(trainer, config, args, encoder_sha):
             "betas": [0.9, 0.98],
             "epochs": args.num_epochs,
             "scheduler": f"CosineAnnealingLR(T_max={args.num_epochs})",
-            "batch_size": _effective_batch_size(args),
+            "batch_size": args.batch_size,
             "train_subset": args.train_subset,
             "val_subset": args.val_subset,
             "test_subset": args.test_subset,
@@ -520,10 +432,10 @@ def save_manifest(trainer, config, args, encoder_sha):
             "jitter_probability": 1.0 if args.temporal_jitter else 0.0,
             "jitter_max_frames": JITTER_MAX_FRAMES if args.temporal_jitter else 0,
             "test_seed": SEED,
-            "output": "frozen Mel + parallel_mp_v1" if phase_mode else "latent-decoder Mel",
+            "output": "phase-refined fused" if args.phase_reconstruction else "fused",
             "waveform_reconstruction": (
-                "frozen completed Mel + predicted unit phase + overlap-add iSTFT"
-                if phase_mode else "Griffin-Lim"
+                "predicted unit phase + inverse Mel + overlap-add iSTFT"
+                if args.phase_reconstruction else "Griffin-Lim"
             ),
         },
     }
@@ -531,6 +443,7 @@ def save_manifest(trainer, config, args, encoder_sha):
     os.makedirs(trainer.run_dir, exist_ok=True)
     with open(path, "w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2, default=str)
+    trainer.logger.info("Saved experiment manifest: %s", path)
 
 
 def train_if_needed(trainer, config, args, checkpoint_path):
@@ -557,7 +470,7 @@ def train_if_needed(trainer, config, args, checkpoint_path):
         "%s %s from epoch 0 (%s)",
         "Force-training" if force else "Training",
         config["tag"],
-        PHASE_ARCH_VERSION if args.phase_reconstruction else ARCH_VERSION,
+        ARCH_VERSION,
     )
 
     # Align the runtime random streams before training each method.
@@ -665,22 +578,16 @@ def save_summary(rows, path):
         writer.writerows(rows)
 
 
-def fusion_result_dir(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False,
-                      phase_complex_loss=False):
-    """One persistent result folder per dataset, condition, and phase objective."""
-    path = Path(log_dir) / experiment_name(
-        temporal_jitter, phase_reconstruction, phase_complex_loss
-    ) / dataset
+def fusion_result_dir(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False):
+    """One persistent result folder per dataset, condition, and phase variant."""
+    path = Path(log_dir) / experiment_name(temporal_jitter, phase_reconstruction) / dataset
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def method_summary_path(log_dir, dataset, method, temporal_jitter=False,
-                        phase_reconstruction=False, phase_complex_loss=False):
+def method_summary_path(log_dir, dataset, method, temporal_jitter=False, phase_reconstruction=False):
     return (
-        fusion_result_dir(
-            log_dir, dataset, temporal_jitter, phase_reconstruction, phase_complex_loss
-        )
+        fusion_result_dir(log_dir, dataset, temporal_jitter, phase_reconstruction)
         / f"{method}_summary.csv"
     )
 
@@ -727,21 +634,15 @@ def _normalize_row(row: dict, method: str) -> dict:
     return normalized
 
 
-def plot_fusion_summaries(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False,
-                          phase_complex_loss=False):
+def plot_fusion_summaries(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False):
     """Create one gap-duration plot per metric from cached method summaries."""
-    result_dir = fusion_result_dir(
-        log_dir, dataset, temporal_jitter, phase_reconstruction, phase_complex_loss
-    )
+    result_dir = fusion_result_dir(log_dir, dataset, temporal_jitter, phase_reconstruction)
     plot_dir = result_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     summaries = {}
     for method in ABLATION_METHODS:
-        path = method_summary_path(
-            log_dir, dataset, method, temporal_jitter,
-            phase_reconstruction, phase_complex_loss
-        )
+        path = method_summary_path(log_dir, dataset, method, temporal_jitter, phase_reconstruction)
         if path.is_file():
             raw = load_summary(path)
             # Normalize schema and drop aggregate/summary rows that have no gap_ms.
@@ -831,12 +732,10 @@ def plot_fusion_summaries(log_dir, dataset, temporal_jitter=False, phase_reconst
 
 
 
-def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
-                                     phase_complex_loss=False):
-    """Compare the selected learned-phase objective with the no-phase baseline."""
+def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False):
+    """Compare learned phase reconstruction against current no-phase Griffin-Lim baselines."""
     phase_dir = fusion_result_dir(
-        log_dir, dataset, temporal_jitter, phase_reconstruction=True,
-        phase_complex_loss=phase_complex_loss
+        log_dir, dataset, temporal_jitter, phase_reconstruction=True
     )
     comparison_dir = phase_dir / "phase_vs_griffin_lim"
     comparison_dir.mkdir(parents=True, exist_ok=True)
@@ -846,8 +745,7 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
     for method in ABLATION_METHODS:
         for variant, phase_flag in (("griffin_lim", False), ("learned_phase", True)):
             path = method_summary_path(
-                log_dir, dataset, method, temporal_jitter, phase_flag,
-                phase_complex_loss if phase_flag else False
+                log_dir, dataset, method, temporal_jitter, phase_flag
             )
             if not path.is_file():
                 continue
@@ -904,11 +802,7 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
                 "temporal_self_cross_attention": "TSCA",
                 "global_local_affinity": "GLA",
             }.get(method, method)
-            label_variant = (
-                "frozen Mel + parallel_mp_v1"
-                if variant == "learned_phase"
-                else "latent Mel + Griffin-Lim"
-            )
+            label_variant = "learned phase" if variant == "learned_phase" else "Griffin-Lim"
             ax.plot(
                 [gap_to_x[g] for g in method_gaps],
                 [points[g] for g in method_gaps],
@@ -916,7 +810,7 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
                 linestyle="-" if variant == "learned_phase" else "--",
                 label=f"{label_method} — {label_variant}",
             )
-        ax.set_title("Frozen Mel + parallel_mp_v1 vs no-phase Mel + Griffin-Lim")
+        ax.set_title("Learned phase reconstruction vs Griffin-Lim")
         ax.set_xlabel("Audio gap duration (ms)")
         ax.set_ylabel(ylabel)
         ax.set_xticks(range(len(ordered_gaps)), [str(g) for g in ordered_gaps])
@@ -928,7 +822,7 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description=f"AV-PLC {ARCH_VERSION} fusion ablation with optional frozen-Mel {PHASE_ARCH_VERSION}."
+        description=f"AV-PLC fusion ablation for current architecture {ARCH_VERSION}, with optional learned phase reconstruction."
     )
     parser.add_argument(
         "--dataset",
@@ -992,36 +886,19 @@ def parse_args():
     )
     parser.add_argument(
         "--phase-reconstruction", action="store_true",
-        help=(f"Train {PHASE_ARCH_VERSION}: load the complete method-specific no-phase "
-              "checkpoint, freeze it, and train only phase_completion.*"),
+        help=("Load each corresponding current-architecture no-phase baseline, freeze it, "
+              "and train/evaluate only the optional shared spectral-completion head. "
+              "Run this script without the flag first."),
     )
-    parser.add_argument(
-        "--phase-batch-size", type=int, default=1,
-        help=("Batch size used only by parallel_mp_v1. Axial TS-Conformer attention at "
-              "F=257,T≈300 is much heavier than the Mel ablation; increase only if memory allows."),
-    )
-    parser.add_argument("--phase-channels", type=int, default=64)
-    parser.add_argument("--phase-ts-blocks", type=int, default=2)
-    parser.add_argument("--phase-ts-heads", type=int, default=4)
-    parser.add_argument("--phase-encoder-dense-depth", type=int, default=3)
-    parser.add_argument("--phase-refine-dense-depth", type=int, default=2)
-    parser.add_argument(
-        "--phase-mag-compression", type=float, default=0.3,
-        help=("Power-compression exponent c used for TFRefine magnitude input, "
-              "magnitude-head target/output, and L_mag. Default 0.3; use 1.0 for "
-              "the no-compression ablation. Physical magnitude is recovered before "
-              "complex/waveform reconstruction."),
-    )
+    parser.add_argument("--no-phase-refine-loss", action="store_true")
     parser.add_argument("--no-phase-unit-loss", action="store_true")
     parser.add_argument("--no-phase-temporal-loss", action="store_true")
     parser.add_argument("--no-phase-frequency-loss", action="store_true")
-    # Starting weights retained from the previous controlled phase objective.
+    # Starting weights for the new auxiliary objectives; validate/tune on validation data.
+    parser.add_argument("--w-phase-refine", type=float, default=0.10)
     parser.add_argument("--w-phase-unit", type=float, default=0.10)
     parser.add_argument("--w-phase-temporal", type=float, default=0.05)
     parser.add_argument("--w-phase-frequency", type=float, default=0.05)
-    parser.add_argument("--w-magnitude", type=float, default=1.0)
-    parser.add_argument("--w-complex", type=float, default=0.10)
-    parser.add_argument("--w-waveform", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -1033,16 +910,6 @@ def main():
         raise ValueError("--gap-ms values must be positive")
     if args.eval_only and args.force_train:
         raise ValueError("--eval-only and --force-train cannot be combined")
-    if args.phase_batch_size <= 0:
-        raise ValueError("--phase-batch-size must be positive")
-    if args.phase_channels <= 0 or args.phase_ts_blocks <= 0 or args.phase_ts_heads <= 0:
-        raise ValueError("phase channel/block/head settings must be positive")
-    if args.phase_channels % args.phase_ts_heads != 0:
-        raise ValueError("--phase-channels must be divisible by --phase-ts-heads")
-    if args.phase_mag_compression <= 0.0:
-        raise ValueError("--phase-mag-compression must be > 0")
-
-    phase_complex_loss = bool(args.phase_reconstruction)
 
     log_dir = project_log_dir("AV_PLC")
     os.makedirs(log_dir, exist_ok=True)
@@ -1057,7 +924,6 @@ def main():
                 method,
                 args.temporal_jitter,
                 args.phase_reconstruction,
-                phase_complex_loss,
             )
 
             if not summary_path.is_file():
@@ -1074,16 +940,13 @@ def main():
             dataset=args.dataset,
             temporal_jitter=args.temporal_jitter,
             phase_reconstruction=args.phase_reconstruction,
-            phase_complex_loss=phase_complex_loss,
         )
         if args.phase_reconstruction:
-            plot_phase_vs_baseline_summaries(
-                log_dir, args.dataset, args.temporal_jitter, phase_complex_loss
-            )
+            plot_phase_vs_baseline_summaries(log_dir, args.dataset, args.temporal_jitter)
 
         print(
             f"Plots saved to: "
-            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction, phase_complex_loss) / 'plots'}"
+            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction) / 'plots'}"
         )
         return
 
@@ -1091,11 +954,17 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     if args.phase_reconstruction:
-        shared_encoder_state = None
-        encoder_sha = None
+        # Each phase run is initialized from the corresponding current no-phase
+        # baseline produced by this same ARCH_VERSION.
+        shared_encoder_state = {}
+        encoder_sha = f"inherited-from-{ARCH_VERSION}-method-baseline"
+        shared_phase_state = make_shared_phase_state()
+        phase_sha = state_hash(shared_phase_state)
     else:
         shared_encoder_state = make_shared_encoder_state(args, checkpoint_dir)
         encoder_sha = state_hash(shared_encoder_state)
+        shared_phase_state = {}
+        phase_sha = None
     selected = set(args.methods)
     selected_configs = [
         config
@@ -1105,40 +974,20 @@ def main():
 
     for config in selected_configs:
         set_global_seed(SEED)
-        trainer = build_trainer(
-            config,
-            args,
-            shared_encoder_state,
-            checkpoint_dir,
-            log_dir,
-        )
+        trainer = build_trainer(config, args, shared_encoder_state,
+                                shared_phase_state, checkpoint_dir, log_dir,)
         try:
             trainer.logger.info("Fusion ablation config: %s", config)
-            trainer.logger.info(
-                "Architecture version: %s",
-                PHASE_ARCH_VERSION if args.phase_reconstruction else ARCH_VERSION,
-            )
-            if encoder_sha is not None:
-                trainer.logger.info("Shared encoder SHA256: %s", encoder_sha)
-            if args.phase_reconstruction:
-                trainer.logger.info("Frozen Mel checkpoint: %s", trainer.model._phase_base_checkpoint)
-            trainer.logger.info(
-                "Trainable parameters: %d",
-                sum(p.numel() for p in trainer.model.parameters() if p.requires_grad),
-            )
-            save_manifest(trainer, config, args, encoder_sha)
+            trainer.logger.info("Architecture version: %s", ARCH_VERSION)
+            trainer.logger.info("Shared encoder SHA256: %s", encoder_sha)
+            if phase_sha is not None:
+                trainer.logger.info("Shared phase initialization SHA256: %s", phase_sha)
+            trainer.logger.info("Trainable parameters: %d",
+                sum(p.numel() for p in trainer.model.parameters() if p.requires_grad),)
+            save_manifest(trainer, config, args, encoder_sha, phase_sha)
 
-            checkpoint_path = os.path.join(
-                checkpoint_dir,
-                config["model_name"],
-                "best_model.pt",
-            )
-            trained_now = train_if_needed(
-                trainer,
-                config,
-                args,
-                checkpoint_path,
-            )
+            checkpoint_path = os.path.join(checkpoint_dir, config["model_name"], "best_model.pt",)
+            trained_now = train_if_needed(trainer, config, args, checkpoint_path,)
 
             if args.skip_eval:
                 continue
@@ -1149,7 +998,6 @@ def main():
                 config["tag"],
                 args.temporal_jitter,
                 args.phase_reconstruction,
-                phase_complex_loss,
             )
 
             # A newly trained checkpoint must always receive a fresh evaluation.
@@ -1164,10 +1012,7 @@ def main():
                 )
             )
             if use_cached_summary:
-                trainer.logger.info(
-                    "Reusing cached evaluation summary: %s",
-                    summary_path,
-                )
+                trainer.logger.info("Reusing cached evaluation summary: %s",summary_path,)
                 continue
 
             strict_load_model_checkpoint(trainer, checkpoint_path)
@@ -1180,18 +1025,11 @@ def main():
     # Summaries are the source of truth for plotting. This also regenerates
     # plots when both evaluations were skipped because their CSVs already exist.
     if not args.skip_eval:
-        plot_fusion_summaries(
-            log_dir, args.dataset, args.temporal_jitter,
-            args.phase_reconstruction, phase_complex_loss
-        )
+        plot_fusion_summaries(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction)
         if args.phase_reconstruction:
-            plot_phase_vs_baseline_summaries(
-                log_dir, args.dataset, args.temporal_jitter, phase_complex_loss
-            )
-        print(
-            "Fusion results: "
-            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction, phase_complex_loss)}"
-        )
+            plot_phase_vs_baseline_summaries(log_dir, args.dataset, args.temporal_jitter)
+        print("Fusion results: "
+            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction)}")
 
 
 if __name__ == "__main__":
@@ -1200,7 +1038,7 @@ if __name__ == "__main__":
 # -----------------------------------------------------------------------------
 # QUICK GRID WORKFLOW
 # -----------------------------------------------------------------------------
-# 1) The corresponding no-phase checkpoints must exist.  Train them first if needed:
+# 1) Current shared-decoder baselines (no learned phase; Griffin-Lim evaluation):
 #
 # python AV_PLC/ablation_fusion.py \
 #     --dataset grid \
@@ -1208,16 +1046,15 @@ if __name__ == "__main__":
 #     --train-subset 5000 --val-subset 500 --test-subset 500 \
 #     --num-epochs 50
 #
-# 2) Freeze each complete no-phase model and train only parallel_mp_v1:
+# 2) learned phase completion.  Requires step 1 checkpoints and the precomputed HDF5 phase datasets:
 #
 # python AV_PLC/ablation_fusion.py \
-#     --dataset grid \
-#     --methods concat temporal_self_cross_attention global_local_affinity \
-#     --phase-reconstruction --phase-batch-size 1 \
-#     --train-subset 5000 --val-subset 500 --test-subset 500 \
-#     --num-epochs 50 \
-#     --force-train concat temporal_self_cross_attention global_local_affinity
+#    --dataset grid \
+#    --methods concat temporal_self_cross_attention global_local_affinity \
+#    --phase-reconstruction \
+#    --train-subset 5000 --val-subset 500 --test-subset 500 \
+#    --num-epochs 30
 #
-# Add --temporal-jitter for the jitter-8 condition.
-# parallel_mp_v1 uses magnitude, IP/GD/IAF, complex, and waveform losses.
-# -----------------------------------------------------------------------------
+# Add --temporal-jitter to either command for the separate jitter-8 experiment.
+# Add --force-train <method names...> only when intentionally overwriting the
+# corresponding ARCH_VERSION checkpoint.
