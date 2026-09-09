@@ -107,6 +107,7 @@ class Trainer:
         w_phase_frequency: float = 0.05,
         w_phase_complex: float = 0.10,
         phase_losses_only: bool = False,
+        phase_only_training: bool = False,
     ):
         self.model = model
         self.model_name = model_name
@@ -136,6 +137,7 @@ class Trainer:
         self.w_phase_frequency = float(w_phase_frequency)
         self.w_phase_complex = float(w_phase_complex)
         self.phase_losses_only = bool(phase_losses_only)
+        self.phase_only_training = bool(phase_only_training)
         if self.phase_losses_only and not self.phase_reconstruction:
             raise ValueError("phase_losses_only=True requires phase_reconstruction=True")
         if self.phase_losses_only and not (
@@ -146,9 +148,27 @@ class Trainer:
             raise ValueError("phase_losses_only=True requires at least one completion/phase loss")
         if self.phase_reconstruction and not getattr(model, 'phase_reconstruction', False):
             raise ValueError('Trainer phase_reconstruction=True requires an AV_PLC model with phase_reconstruction=True')
+        if self.phase_only_training:
+            if not self.phase_reconstruction:
+                raise ValueError("phase_only_training=True requires phase_reconstruction=True")
+            if getattr(model, "phase_completion", None) is None:
+                raise ValueError("phase_only_training=True requires model.phase_completion")
+            if self.completion_mel_loss:
+                raise ValueError("phase-only training must disable completion_mel_loss")
+            if self.phase_complex_loss:
+                raise ValueError("phase-only training must disable phase_complex_loss")
+            if not self.phase_losses_only:
+                raise ValueError("phase-only training requires phase_losses_only=True")
+            if self.enc_loss or self.sc_loss or self.ce_loss or self.pesq_loss or self.stoi_loss or self.asr_loss:
+                raise ValueError(
+                    "phase-only training requires encoder/spectral/perceptual auxiliary losses to be disabled"
+                )
 
         self.train_loader = train_loader
         self.val_loader = val_loader
+        if self.phase_reconstruction and getattr(model, "phase_completion", None) is not None:
+            mel_mean, mel_std = self._get_dataset_stats(train_loader)
+            model.phase_completion.set_mel_stats(mel_mean, mel_std)
         self.learning_rate = learning_rate
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_root = checkpoint_dir
@@ -255,17 +275,29 @@ class Trainer:
         # vocoder
         self.vocoder = Vocoder(self.vocoder_path) if self.vocoder_path is not None else None
 
-        mel_fb = torchaudio.functional.melscale_fbanks(
-            n_freqs=257, f_min=0.0, f_max=8000.0,
-            n_mels=80, sample_rate=16000, norm='slaney', mel_scale='slaney'
-        )
-        self.mel_pinv = torch.linalg.pinv(mel_fb).float().to(self.device)  # [80, 257]
+        if self.phase_complex_loss or self.pesq_loss:
+            mel_fb = torchaudio.functional.melscale_fbanks(
+                n_freqs=257, f_min=0.0, f_max=8000.0,
+                n_mels=80, sample_rate=16000, norm='slaney', mel_scale='slaney'
+            )
+            self.mel_pinv = torch.linalg.pinv(mel_fb).float().to(self.device)  # [80, 257]
+        else:
+            self.mel_pinv = None
 
         # optimizer + scheduler
-        # trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        if not trainable_params:
+        trainable_named = [(name, p) for name, p in self.model.named_parameters() if p.requires_grad]
+        if not trainable_named:
             raise ValueError("Model has no trainable parameters")
+        if self.phase_only_training:
+            bad = [name for name, _ in trainable_named if not name.startswith("phase_completion.")]
+            if bad:
+                raise ValueError(
+                    "phase-only training found trainable non-phase parameters: "
+                    + ", ".join(bad[:20])
+                )
+            if not any(name.startswith("phase_completion.") for name, _ in trainable_named):
+                raise ValueError("phase-only training has no trainable phase_completion parameters")
+        trainable_params = [p for _, p in trainable_named]
         self.optimizer = optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -606,8 +638,9 @@ class Trainer:
                 parts['asr_loss'] = None
 
         if self.phase_losses_only:
-            # Compatibility mode: exclude auxiliary encoder/perceptual objectives,
-            # but never discard the primary Mel reconstruction objective.
+            # Restrict checkpoint/training objective to explicitly enabled completion
+            # and phase terms.  In the phase_tf_v1 experiment completion Mel is
+            # disabled, so this becomes exactly Lu + Lt + Lf (weighted).
             loss = completion_weighted_loss + phase_weighted_loss
 
         parts['loss'] = loss

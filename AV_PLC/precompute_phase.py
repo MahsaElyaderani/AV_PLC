@@ -1,4 +1,4 @@
-"""Append clean STFT magnitude and phase to existing AV_PLC HDF5 datasets.
+"""Append clean STFT phase to existing AV_PLC HDF5 datasets.
 
 Run this once before training/evaluating with ``phase_reconstruction=True``.
 The STFT geometry exactly mirrors the current Mel extraction in save_features.py:
@@ -49,7 +49,7 @@ def resolve_media_path(video_path: str) -> str:
     return candidate
 
 
-def waveform_stft(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def waveform_phase(audio: np.ndarray) -> np.ndarray:
     wav = torch.as_tensor(audio, dtype=torch.float32)
     expected = int(round(SAMPLE_RATE * TARGET_SECONDS))
     if wav.numel() < expected:
@@ -70,9 +70,7 @@ def waveform_stft(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         onesided=True,
         return_complex=True,
     )
-    magnitude = stft.abs().cpu().numpy().astype(np.float32, copy=False)
-    phase = torch.angle(stft).cpu().numpy().astype(np.float32, copy=False)
-    return magnitude, phase
+    return torch.angle(stft).cpu().numpy().astype(np.float32, copy=False)
 
 
 def expand_h5_patterns(dataset: str, splits: list[str]) -> list[str]:
@@ -97,8 +95,7 @@ def process_h5(path: str, overwrite: bool, storage_dtype: str) -> tuple[int, int
         video_keys = sorted(h5f.keys())
         for video_key in tqdm(video_keys, desc=Path(path).name, leave=False):
             phase_key = f"{video_key}/phase"
-            magnitude_key = f"{video_key}/stft_magnitude"
-            if phase_key in h5f and magnitude_key in h5f and not overwrite:
+            if phase_key in h5f and not overwrite:
                 skipped += 1
                 continue
 
@@ -109,29 +106,25 @@ def process_h5(path: str, overwrite: bool, storage_dtype: str) -> tuple[int, int
             audio = load_audio_ffmpeg(
                 media_path, sr=SAMPLE_RATE, fixlen_sec=TARGET_SECONDS
             )
-            magnitude, phase = waveform_stft(audio)
+            phase = waveform_phase(audio)
 
-            if phase.shape[0] != PHASE_BINS or magnitude.shape[0] != PHASE_BINS:
+            if phase.shape[0] != PHASE_BINS:
                 raise RuntimeError(
                     f"Unexpected phase bins for {video_key}: {phase.shape}; expected {PHASE_BINS}"
                 )
             spec = h5f[f"{video_key}/spec"]
-            if phase.shape[-1] != spec.shape[-1] or magnitude.shape[-1] != spec.shape[-1]:
+            if phase.shape[-1] != spec.shape[-1]:
                 raise RuntimeError(
-                    "STFT/Mel time mismatch. Refusing to crop/interpolate STFT targets: "
-                    f"{video_key}: magnitude T={magnitude.shape[-1]}, phase T={phase.shape[-1]}, "
-                    f"Mel T={spec.shape[-1]}"
+                    "STFT/Mel time mismatch. Refusing to crop/interpolate phase: "
+                    f"{video_key}: phase T={phase.shape[-1]}, Mel T={spec.shape[-1]}"
                 )
 
             if phase_key in h5f:
                 del h5f[phase_key]
-            if magnitude_key in h5f:
-                del h5f[magnitude_key]
             h5f.create_dataset(
-                phase_key, data=phase.astype(np_dtype, copy=False), compression="gzip"
-            )
-            h5f.create_dataset(
-                magnitude_key, data=magnitude.astype(np_dtype, copy=False), compression="gzip"
+                phase_key,
+                data=phase.astype(np_dtype, copy=False),
+                compression="gzip",
             )
             added += 1
     return added, skipped
@@ -139,7 +132,7 @@ def process_h5(path: str, overwrite: bool, storage_dtype: str) -> tuple[int, int
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Append clean STFT magnitude and phase to existing AV_PLC HDF5 chunks."
+        description="Append clean STFT phase to existing AV_PLC HDF5 chunks."
     )
     parser.add_argument(
         "--datasets",
@@ -170,7 +163,7 @@ def main() -> None:
             total_added += added
             total_skipped += skipped
 
-    print(f"Done. STFT magnitude+phase added/updated={total_added}, skipped_existing={total_skipped}")
+    print(f"Done. phase added/updated={total_added}, skipped_existing={total_skipped}")
 
 
 if __name__ == "__main__":
