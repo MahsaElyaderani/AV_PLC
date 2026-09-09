@@ -96,3 +96,27 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# python -m AV_PLC.build_reference_face \
+#   --videos "../datasets/grid/train/**/*.mpg" \
+#   --output AV_PLC/reference_face_grid.npy \
+#   --max-faces 2000 \
+#   --frame-stride 10
+
+# python -m AV_PLC.build_reference_face \
+#   --videos "../datasets/lrs2/lrs2_v1/mvlrs_v1/pretrain/**/*.mp4" \
+#   --output AV_PLC/reference_face_lrs2.npy \
+#   --max-faces 2000 \
+#   --frame-stride 10
+
+# python -m AV_PLC.build_reference_face \
+#   --videos "../datasets/vox2_short/vox2_dev_mp4/**/*.mp4" \
+#   --output AV_PLC/reference_face_voxceleb2.npy \
+#   --max-faces 2000 \
+#   --frame-stride 10
+
+#
+# import numpy as np
+# x = np.load("AV_PLC/reference_face.npy")
+# print(x.shape, x.dtype)
+# print(x[:5])
