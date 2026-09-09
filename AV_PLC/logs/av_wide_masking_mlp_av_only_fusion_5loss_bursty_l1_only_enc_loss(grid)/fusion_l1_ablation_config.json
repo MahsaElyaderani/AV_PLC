@@ -1,0 +1,71 @@
+{
+  "experiment": "AV-PLC L1-only fusion ablation",
+  "dataset": "grid",
+  "seed": 42,
+  "method": {
+    "tag": "concat",
+    "fusion_type": "concat",
+    "local_radius": 12,
+    "local_heads": 4,
+    "model_name": "av_wide_masking_mlp_av_only_fusion_5loss_bursty_l1_only_enc_loss(grid)"
+  },
+  "shared_encoder_initialization_sha256": "a4486ee2507a2652ed8fafaea0d4040579e68185b5f73d6c0453a429cc173a90",
+  "same_for_both_methods": {
+    "encoders": {
+      "mel_dim": 80,
+      "feat_dim": 256,
+      "dropout": 0.1,
+      "video_depth": 6,
+      "video_heads": 4,
+      "video_hidden_size": 256,
+      "audio_depth": 4,
+      "audio_heads": 4,
+      "audio_hidden_size": 256,
+      "audio_ckpt_path": null,
+      "freeze_audio_enc": false
+    },
+    "training_mask": "bursty GE; per-access loss rate uniform in [0.3, 0.9]",
+    "validation_mask": "stable bursty GE; seed=SEED; range [0.3, 0.9]",
+    "modality_dropout": true,
+    "augmentations": [
+      "HorizontalFlip(0.5)",
+      "RandomErase(0.4)",
+      "TimeMask(0.4 s)"
+    ],
+    "temporal_jitter": false,
+    "loss": "L1 only; enc_loss=True",
+    "optimizer": "AdamW",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.98
+    ],
+    "epochs": 100,
+    "scheduler": "CosineAnnealingLR(T_max=100)",
+    "batch_size": 16,
+    "train_subset": null,
+    "val_subset": null,
+    "test_subset": null
+  },
+  "evaluation": {
+    "gilbert_loss_rates": [
+      10,
+      20,
+      30,
+      40,
+      50,
+      60,
+      70,
+      80,
+      90
+    ],
+    "single_gap_ms": [
+      160,
+      500,
+      1000
+    ],
+    "test_seed": 42,
+    "output": "fused"
+  }
+}

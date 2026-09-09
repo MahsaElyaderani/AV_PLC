@@ -1,0 +1,10 @@
+dataset,split,total_samples,resolved_files,missing_files,audio_probe_failed,mono_count,stereo_count,multi_channel_count,stereo_percent_of_total,stereo_percent_of_resolved
+grid,train,25000,25000,0,0,0,25000,0,100.0,100.0
+grid,val,4000,4000,0,0,0,4000,0,100.0,100.0
+grid,test,4000,4000,0,0,0,4000,0,100.0,100.0
+lrs2,train,45776,45776,0,0,45776,0,0,0.0,0.0
+lrs2,val,1081,1081,0,0,1081,0,0,0.0,0.0
+lrs2,test,1243,1243,0,0,1243,0,0,0.0,0.0
+voxceleb2,train,143402,143402,0,0,143402,0,0,0.0,0.0
+voxceleb2,val,15933,15933,0,0,15933,0,0,0.0,0.0
+voxceleb2,test,7754,7754,0,0,7754,0,0,0.0,0.0

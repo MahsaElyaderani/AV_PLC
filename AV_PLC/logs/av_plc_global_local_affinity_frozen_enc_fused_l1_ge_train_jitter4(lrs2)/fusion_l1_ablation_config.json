@@ -1,0 +1,67 @@
+{
+  "experiment": "AV-PLC frozen-encoder L1-only fusion ablation",
+  "dataset": "lrs2",
+  "seed": 42,
+  "method": {
+    "tag": "global_local_affinity",
+    "fusion_type": "global_local_affinity",
+    "local_radius": 12,
+    "local_heads": 4,
+    "freeze_encoders": true,
+    "model_name": "av_plc_global_local_affinity_frozen_enc_fused_l1_ge_train_v2_jitter2(lrs2)"
+  },
+  "pretrained_encoder_sha256": "2ae0c99b569556a49d772c1f03228bffb94b86b714821e47fb3c0024a6ab24a7",
+  "controlled_settings": {
+    "encoders": {
+      "mel_dim": 80,
+      "feat_dim": 256,
+      "dropout": 0.1,
+      "video_depth": 6,
+      "video_heads": 4,
+      "video_hidden_size": 256,
+      "audio_depth": 4,
+      "audio_heads": 4,
+      "audio_hidden_size": 256,
+      "audio_ckpt_path": null,
+      "freeze_audio_enc": false
+    },
+    "encoder_source": "existing L1-only concat best_model.pt",
+    "encoders_frozen": true,
+    "training_mask": "bursty GE; per-access loss rate uniform in [0.3, 0.9]",
+    "validation_mask": "stable bursty GE; seed=SEED; range [0.3, 0.9]",
+    "modality_dropout": true,
+    "augmentations": [
+      "HorizontalFlip(0.5)",
+      "RandomErase(0.4)",
+      "TimeMask(0.4 s)"
+    ],
+    "temporal_jitter_train_val": true,
+    "jitter_probability_train_val": 0.5,
+    "jitter_max_frames": 2,
+    "loss": "L1 only: fused reconstruction plus audio/video encoder auxiliary losses; pretrained encoders frozen",
+    "optimizer": "AdamW",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.98
+    ],
+    "epochs": 100,
+    "scheduler": "CosineAnnealingLR(T_max=100)",
+    "batch_size": 16,
+    "train_subset": null,
+    "val_subset": null,
+    "test_subset": null
+  },
+  "evaluation": {
+    "mask_type": "single_gap",
+    "single_gap_ms": [
+      160,
+      500,
+      1000
+    ],
+    "temporal_jitter": true,
+    "test_seed": 42,
+    "output": "fused"
+  }
+}

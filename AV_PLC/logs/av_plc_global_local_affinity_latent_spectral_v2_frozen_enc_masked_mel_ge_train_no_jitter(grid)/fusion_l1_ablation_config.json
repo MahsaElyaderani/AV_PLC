@@ -1,0 +1,78 @@
+{
+  "experiment": "ablation_fusion_latent_spectral_v2_no_jitter",
+  "dataset": "grid",
+  "architecture_version": "latent_spectral_v2",
+  "seed": 42,
+  "method": {
+    "tag": "global_local_affinity",
+    "fusion_type": "global_local_affinity",
+    "freeze_encoders": true,
+    "base_model_name": "av_plc_global_local_affinity_latent_spectral_v2_frozen_enc_masked_mel_ge_train_no_jitter(grid)",
+    "model_name": "av_plc_global_local_affinity_latent_spectral_v2_frozen_enc_masked_mel_ge_train_no_jitter(grid)"
+  },
+  "pretrained_encoder_sha256": "d811f02345f6e89e910c34894dfedbcb691a25e2df025a24453e097191ca36f3",
+  "controlled_settings": {
+    "encoders": {
+      "mel_dim": 80,
+      "feat_dim": 256,
+      "dropout": 0.1,
+      "video_depth": 6,
+      "video_heads": 4,
+      "video_hidden_size": 256,
+      "audio_depth": 4,
+      "audio_heads": 4,
+      "audio_hidden_size": 256,
+      "audio_ckpt_path": null,
+      "freeze_audio_enc": false
+    },
+    "encoder_source": "historical concat checkpoint: audio_enc.* and video_enc.* only",
+    "encoders_frozen": true,
+    "phase_reconstruction": false,
+    "phase_training": "disabled; latent decoder predicts Mel and evaluation uses Griffin-Lim",
+    "loss_weights": {
+      "completion_mel": 1.0,
+      "phase_unit": 0.1,
+      "temporal": 0.05,
+      "frequency": 0.05
+    },
+    "training_mask": "bursty GE; per-access loss rate uniform in [0.3, 0.9]",
+    "validation_mask": "stable bursty GE; seed=SEED; range [0.3, 0.9]",
+    "modality_dropout": true,
+    "augmentations": [
+      "HorizontalFlip(0.5)",
+      "RandomErase(0.4)",
+      "TimeMask(0.4 s)"
+    ],
+    "temporal_jitter_train_val": false,
+    "jitter_probability_train_val": 0.0,
+    "jitter_max_frames": 0,
+    "loss": "masked absolute log-Mel reconstruction only; pretrained encoders frozen",
+    "optimizer": "AdamW",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.98
+    ],
+    "epochs": 50,
+    "scheduler": "CosineAnnealingLR(T_max=50)",
+    "batch_size": 16,
+    "train_subset": 5000,
+    "val_subset": 500,
+    "test_subset": 500
+  },
+  "evaluation": {
+    "mask_type": "single_gap",
+    "single_gap_ms": [
+      160,
+      500,
+      1000
+    ],
+    "temporal_jitter": false,
+    "jitter_probability": 0.0,
+    "jitter_max_frames": 0,
+    "test_seed": 42,
+    "output": "latent-decoder Mel",
+    "waveform_reconstruction": "Griffin-Lim"
+  }
+}

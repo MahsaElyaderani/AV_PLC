@@ -1,0 +1,69 @@
+{
+  "experiment": "ablation_fusion_frozen_encoders__no_jitter",
+  "dataset": "grid",
+  "seed": 42,
+  "method": {
+    "tag": "temporal_self_cross_attention",
+    "fusion_type": "temporal_self_cross_attention",
+    "local_radius": 12,
+    "local_heads": 4,
+    "freeze_encoders": true,
+    "model_name": "av_plc_temporal_self_cross_attention_frozen_enc_fused_l1_ge_train__no_jitter(grid)"
+  },
+  "pretrained_encoder_sha256": "d811f02345f6e89e910c34894dfedbcb691a25e2df025a24453e097191ca36f3",
+  "controlled_settings": {
+    "encoders": {
+      "mel_dim": 80,
+      "feat_dim": 256,
+      "dropout": 0.1,
+      "video_depth": 6,
+      "video_heads": 4,
+      "video_hidden_size": 256,
+      "audio_depth": 4,
+      "audio_heads": 4,
+      "audio_hidden_size": 256,
+      "audio_ckpt_path": null,
+      "freeze_audio_enc": false
+    },
+    "encoder_source": "existing L1-only concat best_model.pt",
+    "encoders_frozen": true,
+    "training_mask": "bursty GE; per-access loss rate uniform in [0.3, 0.9]",
+    "validation_mask": "stable bursty GE; seed=SEED; range [0.3, 0.9]",
+    "modality_dropout": true,
+    "augmentations": [
+      "HorizontalFlip(0.5)",
+      "RandomErase(0.4)",
+      "TimeMask(0.4 s)"
+    ],
+    "temporal_jitter_train_val": false,
+    "jitter_probability_train_val": 0.0,
+    "jitter_max_frames": 0,
+    "loss": "L1 only: fused reconstruction plus audio/video encoder auxiliary losses; pretrained encoders frozen",
+    "optimizer": "AdamW",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.98
+    ],
+    "epochs": 50,
+    "scheduler": "CosineAnnealingLR(T_max=50)",
+    "batch_size": 16,
+    "train_subset": 5000,
+    "val_subset": 500,
+    "test_subset": 500
+  },
+  "evaluation": {
+    "mask_type": "single_gap",
+    "single_gap_ms": [
+      160,
+      500,
+      1000
+    ],
+    "temporal_jitter": false,
+    "jitter_probability": 0.0,
+    "jitter_max_frames": 0,
+    "test_seed": 42,
+    "output": "fused"
+  }
+}

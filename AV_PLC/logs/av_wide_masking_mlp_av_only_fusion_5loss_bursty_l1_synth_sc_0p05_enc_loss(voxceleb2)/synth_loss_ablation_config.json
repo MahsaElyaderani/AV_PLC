@@ -1,0 +1,18 @@
+{
+  "dataset": "voxceleb2",
+  "seed": 42,
+  "num_epochs": 100,
+  "learning_rate": 0.0001,
+  "batch_size": 16,
+  "num_workers": 8,
+  "test_subset": null,
+  "experiment": {
+    "tag": "l1_synth_sc_0p05",
+    "model_name": "av_wide_masking_mlp_av_only_fusion_5loss_bursty_l1_synth_sc_0p05_enc_loss(voxceleb2)",
+    "sc_loss": true,
+    "ce_loss": false,
+    "synth_sc_weight": 0.05,
+    "synth_ce_weight": 0.0
+  },
+  "loss_design": "L1 on fused/audio/synth heads through the existing trainer logic; optional Mel-SC or Mel-CE is added only to synth_spec."
+}

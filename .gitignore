@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / IDE
+.DS_Store
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# ML checkpoints / large artifacts
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.npz
+*.wav
+*.mp4
+*.tfevents.*
+
+# Common generated outputs
+checkpoints/
+outputs/
+av_hubert/
+
+# Generated visual outputs
+*.png
+*.jpg
+*.jpeg
+*.gif
+qualitative_previews/

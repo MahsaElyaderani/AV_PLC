@@ -1,0 +1,37 @@
+AV_PLC FINAL DIAGNOSTIC DECISION REPORT
+========================================
+
+This report uses diagnostic thresholds only to make the implementation path explicit; they are not universal statistical significance thresholds.
+
+Prior F-C mean PESQ: +0.0351
+Prior F-C mean PLCMOS: +0.1048
+Prior D-F mean PESQ remaining Mel headroom: +1.1582
+Prior D-F mean PLCMOS remaining Mel headroom: +0.3854
+Magnitude-path implication: preserve/protect the no-phase Mel decoder; long-gap Mel quality still has substantial headroom.
+
+Common-rotation evidence:
+  median frame R concentration (median across method/gap summaries): 0.4174
+  median frame R p25: 0.2343
+  median high-energy R: 0.6267
+  mean magnitude-weighted unit circular-error reduction after oracle rotation: 0.3236
+  mean magnitude-weighted temporal circular-error reduction after oracle rotation: 0.1731
+  max frequency-difference circular-error change (must be ~0): 3.576e-07
+  median temporal-error concentration R: 0.4125
+  median |temporal common-error angle - delta alpha|: 18.48 deg
+
+Perceptual headroom:
+  median fraction of B->C PESQ headroom recovered by G: 0.1112
+  median fraction of B->C PLCMOS headroom recovered by G: 0.0965
+  fraction of method/gap cells where G beats Griffin-Lim in PESQ: 0.778
+  fraction of method/gap cells where G beats Griffin-Lim in PLCMOS: 0.000
+
+VERDICT: COMMON_ROTATION_HYPOTHESIS_NOT_SUPPORTED_AS_DOMINANT
+
+NEXT MAGNITUDE+PHASE IMPLEMENTATION:
+  Magnitude/Mel: keep the successful no-phase Mel path separate/protected from phase gradients.
+  Phase: Protect Mel and build a separate phase-specialized decoder, but do not organize it primarily around one scalar alpha_t. Directly model temporal phase increments plus frequency-relative structure (or an explicit complex/phase residual representation) with observed boundary phase.
+  Training order: initialize/freeze the successful Mel branch first; train the phase branch; only consider later low-LR Mel unfreezing if it does not reduce Mel/PESQ/PLCMOS.
+  Initial phase objective: circular absolute/unit + direct temporal-increment supervision + frequency-relative supervision; do not reintroduce projected complex loss as the first step because the previous complex_v1 result did not improve perceptual quality.
+
+STOP RULE:
+  This diagnostic is designed to choose the phase-decoder structure. Once the verdict is obtained, move to implementation rather than adding another oracle unless a sanity invariant fails.

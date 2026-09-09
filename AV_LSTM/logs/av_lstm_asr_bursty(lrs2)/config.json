@@ -1,0 +1,9 @@
+{
+    "model_name": "av_lstm_asr_bursty(lrs2)",
+    "mode": "av",
+    "learning_rate": 0.001,
+    "weight_decay": 0.0,
+    "mixed_precision": false,
+    "early_stopping_patience": 101,
+    "sample_rate": 16000
+}
