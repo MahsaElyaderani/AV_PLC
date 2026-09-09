@@ -96,14 +96,23 @@ def experiment_suffix(temporal_jitter: bool) -> str:
     return f"_jitter{JITTER_MAX_FRAMES}" if temporal_jitter else "_no_jitter"
 
 
-def experiment_name(temporal_jitter: bool, phase_reconstruction: bool = False) -> str:
+def experiment_name(temporal_jitter: bool, phase_reconstruction: bool = False,
+                    phase_complex_loss: bool = False) -> str:
     name = f"ablation_fusion_{ARCH_VERSION}{experiment_suffix(temporal_jitter)}"
-    return name + ("_phase_reconstruction" if phase_reconstruction else "")
+    if not phase_reconstruction:
+        return name
+    suffix = "_phase_reconstruction"
+    if phase_complex_loss:
+        suffix += "_complex_v1"
+    return name + suffix
 
 
-def phase_model_name(base_model_name: str) -> str:
-    """Keep learned-phase checkpoints separate from all existing fusion checkpoints."""
-    return f"{base_model_name}_phase_reconstruction"
+def phase_model_name(base_model_name: str, phase_complex_loss: bool = False) -> str:
+    """Keep each learned-phase training objective in a distinct checkpoint."""
+    suffix = "_phase_reconstruction"
+    if phase_complex_loss:
+        suffix += "_complex_v1"
+    return f"{base_model_name}{suffix}"
 
 
 def frozen_concat_model_name(dataset: str, temporal_jitter: bool = False) -> str:
@@ -136,6 +145,9 @@ def frozen_global_local_affinity_model_name(
 def configs(dataset: str, radius: int, args=None):
     temporal_jitter = bool(args and args.temporal_jitter)
     phase_reconstruction = bool(args and args.phase_reconstruction)
+    phase_complex_loss = bool(
+        args and args.phase_reconstruction and not args.no_phase_complex_loss
+    )
 
     bases = [
         dict(
@@ -163,7 +175,7 @@ def configs(dataset: str, radius: int, args=None):
     ]
     for config in bases:
         config["model_name"] = (
-            phase_model_name(config["base_model_name"])
+            phase_model_name(config["base_model_name"], phase_complex_loss)
             if phase_reconstruction
             else config["base_model_name"]
         )
@@ -343,9 +355,13 @@ def build_trainer(config, args, shared_encoder_state, checkpoint_dir, log_dir):
         phase_unit_loss=not args.no_phase_unit_loss,
         phase_temporal_loss=not args.no_phase_temporal_loss,
         phase_frequency_loss=not args.no_phase_frequency_loss,
+        phase_complex_loss=(
+            args.phase_reconstruction and not args.no_phase_complex_loss
+        ),
         w_phase_unit=args.w_phase_unit,
         w_phase_temporal=args.w_phase_temporal,
         w_phase_frequency=args.w_phase_frequency,
+        w_phase_complex=args.w_phase_complex,
         phase_losses_only=False,
     )
 
@@ -358,8 +374,13 @@ def build_trainer(config, args, shared_encoder_state, checkpoint_dir, log_dir):
 
 
 def save_manifest(trainer, config, args, encoder_sha):
+    phase_complex_loss = bool(
+        args.phase_reconstruction and not args.no_phase_complex_loss
+    )
     manifest = {
-        "experiment": experiment_name(args.temporal_jitter, args.phase_reconstruction),
+        "experiment": experiment_name(
+            args.temporal_jitter, args.phase_reconstruction, phase_complex_loss
+        ),
         "dataset": args.dataset,
         "architecture_version": ARCH_VERSION,
         "seed": SEED,
@@ -370,6 +391,7 @@ def save_manifest(trainer, config, args, encoder_sha):
             "encoder_source": "historical concat checkpoint: audio_enc.* and video_enc.* only",
             "encoders_frozen": True,
             "phase_reconstruction": args.phase_reconstruction,
+            "phase_complex_loss": phase_complex_loss,
             "phase_training": (
                 "joint latent+phase decoder trained fresh; phase is merged before the shared spectral Conformer"
                 if args.phase_reconstruction else "disabled; latent decoder predicts Mel and evaluation uses Griffin-Lim"
@@ -379,6 +401,7 @@ def save_manifest(trainer, config, args, encoder_sha):
                 "phase_unit": args.w_phase_unit,
                 "temporal": args.w_phase_temporal,
                 "frequency": args.w_phase_frequency,
+                "projected_complex": args.w_phase_complex if phase_complex_loss else 0.0,
             },
             "training_mask": "bursty GE; per-access loss rate uniform in [0.3, 0.9]",
             "validation_mask": "stable bursty GE; seed=SEED; range [0.3, 0.9]",
@@ -392,7 +415,11 @@ def save_manifest(trainer, config, args, encoder_sha):
             "jitter_probability_train_val": 0.5 if args.temporal_jitter else 0.0,
             "jitter_max_frames": JITTER_MAX_FRAMES if args.temporal_jitter else 0,
             "loss": (
-                "masked absolute log-Mel reconstruction + unit/temporal/frequency phase losses; pretrained encoders frozen"
+                (
+                    "masked absolute log-Mel reconstruction + unit/temporal/frequency phase losses"
+                    + (" + projected complex-spectrum consistency loss" if phase_complex_loss else "")
+                    + "; pretrained encoders frozen"
+                )
                 if args.phase_reconstruction
                 else "masked absolute log-Mel reconstruction only; pretrained encoders frozen"
             ),
@@ -560,16 +587,22 @@ def save_summary(rows, path):
         writer.writerows(rows)
 
 
-def fusion_result_dir(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False):
-    """One persistent result folder per dataset, condition, and phase variant."""
-    path = Path(log_dir) / experiment_name(temporal_jitter, phase_reconstruction) / dataset
+def fusion_result_dir(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False,
+                      phase_complex_loss=False):
+    """One persistent result folder per dataset, condition, and phase objective."""
+    path = Path(log_dir) / experiment_name(
+        temporal_jitter, phase_reconstruction, phase_complex_loss
+    ) / dataset
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def method_summary_path(log_dir, dataset, method, temporal_jitter=False, phase_reconstruction=False):
+def method_summary_path(log_dir, dataset, method, temporal_jitter=False,
+                        phase_reconstruction=False, phase_complex_loss=False):
     return (
-        fusion_result_dir(log_dir, dataset, temporal_jitter, phase_reconstruction)
+        fusion_result_dir(
+            log_dir, dataset, temporal_jitter, phase_reconstruction, phase_complex_loss
+        )
         / f"{method}_summary.csv"
     )
 
@@ -616,15 +649,21 @@ def _normalize_row(row: dict, method: str) -> dict:
     return normalized
 
 
-def plot_fusion_summaries(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False):
+def plot_fusion_summaries(log_dir, dataset, temporal_jitter=False, phase_reconstruction=False,
+                          phase_complex_loss=False):
     """Create one gap-duration plot per metric from cached method summaries."""
-    result_dir = fusion_result_dir(log_dir, dataset, temporal_jitter, phase_reconstruction)
+    result_dir = fusion_result_dir(
+        log_dir, dataset, temporal_jitter, phase_reconstruction, phase_complex_loss
+    )
     plot_dir = result_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     summaries = {}
     for method in ABLATION_METHODS:
-        path = method_summary_path(log_dir, dataset, method, temporal_jitter, phase_reconstruction)
+        path = method_summary_path(
+            log_dir, dataset, method, temporal_jitter,
+            phase_reconstruction, phase_complex_loss
+        )
         if path.is_file():
             raw = load_summary(path)
             # Normalize schema and drop aggregate/summary rows that have no gap_ms.
@@ -714,10 +753,12 @@ def plot_fusion_summaries(log_dir, dataset, temporal_jitter=False, phase_reconst
 
 
 
-def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False):
-    """Compare independently trained joint-phase and no-phase latent-decoder variants."""
+def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False,
+                                     phase_complex_loss=False):
+    """Compare the selected learned-phase objective with the no-phase baseline."""
     phase_dir = fusion_result_dir(
-        log_dir, dataset, temporal_jitter, phase_reconstruction=True
+        log_dir, dataset, temporal_jitter, phase_reconstruction=True,
+        phase_complex_loss=phase_complex_loss
     )
     comparison_dir = phase_dir / "phase_vs_griffin_lim"
     comparison_dir.mkdir(parents=True, exist_ok=True)
@@ -727,7 +768,8 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False):
     for method in ABLATION_METHODS:
         for variant, phase_flag in (("griffin_lim", False), ("learned_phase", True)):
             path = method_summary_path(
-                log_dir, dataset, method, temporal_jitter, phase_flag
+                log_dir, dataset, method, temporal_jitter, phase_flag,
+                phase_complex_loss if phase_flag else False
             )
             if not path.is_file():
                 continue
@@ -784,7 +826,13 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False):
                 "temporal_self_cross_attention": "TSCA",
                 "global_local_affinity": "GLA",
             }.get(method, method)
-            label_variant = "joint latent+phase" if variant == "learned_phase" else "latent Mel + Griffin-Lim"
+            label_variant = (
+                "joint latent+phase + complex consistency"
+                if variant == "learned_phase" and phase_complex_loss
+                else "joint latent+phase"
+                if variant == "learned_phase"
+                else "latent Mel + Griffin-Lim"
+            )
             ax.plot(
                 [gap_to_x[g] for g in method_gaps],
                 [points[g] for g in method_gaps],
@@ -792,7 +840,11 @@ def plot_phase_vs_baseline_summaries(log_dir, dataset, temporal_jitter=False):
                 linestyle="-" if variant == "learned_phase" else "--",
                 label=f"{label_method} — {label_variant}",
             )
-        ax.set_title("Joint latent+phase vs no-phase latent decoder")
+        ax.set_title(
+            "Joint latent+phase"
+            + (" + complex consistency" if phase_complex_loss else "")
+            + " vs no-phase latent decoder"
+        )
         ax.set_xlabel("Audio gap duration (ms)")
         ax.set_ylabel(ylabel)
         ax.set_xticks(range(len(ordered_gaps)), [str(g) for g in ordered_gaps])
@@ -876,10 +928,16 @@ def parse_args():
     parser.add_argument("--no-phase-unit-loss", action="store_true")
     parser.add_argument("--no-phase-temporal-loss", action="store_true")
     parser.add_argument("--no-phase-frequency-loss", action="store_true")
+    parser.add_argument(
+        "--no-phase-complex-loss", action="store_true",
+        help=("Disable projected complex-spectrum consistency. By default it is "
+              "enabled whenever --phase-reconstruction is active."),
+    )
     # Starting weights for phase objectives; validate/tune on validation data.
     parser.add_argument("--w-phase-unit", type=float, default=0.10)
     parser.add_argument("--w-phase-temporal", type=float, default=0.05)
     parser.add_argument("--w-phase-frequency", type=float, default=0.05)
+    parser.add_argument("--w-phase-complex", type=float, default=0.10)
     return parser.parse_args()
 
 
@@ -891,6 +949,10 @@ def main():
         raise ValueError("--gap-ms values must be positive")
     if args.eval_only and args.force_train:
         raise ValueError("--eval-only and --force-train cannot be combined")
+
+    phase_complex_loss = bool(
+        args.phase_reconstruction and not args.no_phase_complex_loss
+    )
 
     log_dir = project_log_dir("AV_PLC")
     os.makedirs(log_dir, exist_ok=True)
@@ -905,6 +967,7 @@ def main():
                 method,
                 args.temporal_jitter,
                 args.phase_reconstruction,
+                phase_complex_loss,
             )
 
             if not summary_path.is_file():
@@ -921,13 +984,16 @@ def main():
             dataset=args.dataset,
             temporal_jitter=args.temporal_jitter,
             phase_reconstruction=args.phase_reconstruction,
+            phase_complex_loss=phase_complex_loss,
         )
         if args.phase_reconstruction:
-            plot_phase_vs_baseline_summaries(log_dir, args.dataset, args.temporal_jitter)
+            plot_phase_vs_baseline_summaries(
+                log_dir, args.dataset, args.temporal_jitter, phase_complex_loss
+            )
 
         print(
             f"Plots saved to: "
-            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction) / 'plots'}"
+            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction, phase_complex_loss) / 'plots'}"
         )
         return
 
@@ -983,6 +1049,7 @@ def main():
                 config["tag"],
                 args.temporal_jitter,
                 args.phase_reconstruction,
+                phase_complex_loss,
             )
 
             # A newly trained checkpoint must always receive a fresh evaluation.
@@ -1013,12 +1080,17 @@ def main():
     # Summaries are the source of truth for plotting. This also regenerates
     # plots when both evaluations were skipped because their CSVs already exist.
     if not args.skip_eval:
-        plot_fusion_summaries(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction)
+        plot_fusion_summaries(
+            log_dir, args.dataset, args.temporal_jitter,
+            args.phase_reconstruction, phase_complex_loss
+        )
         if args.phase_reconstruction:
-            plot_phase_vs_baseline_summaries(log_dir, args.dataset, args.temporal_jitter)
+            plot_phase_vs_baseline_summaries(
+                log_dir, args.dataset, args.temporal_jitter, phase_complex_loss
+            )
         print(
             "Fusion results: "
-            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction)}"
+            f"{fusion_result_dir(log_dir, args.dataset, args.temporal_jitter, args.phase_reconstruction, phase_complex_loss)}"
         )
 
 
@@ -1028,7 +1100,7 @@ if __name__ == "__main__":
 # -----------------------------------------------------------------------------
 # QUICK GRID WORKFLOW
 # -----------------------------------------------------------------------------
-# 1) Latent-only Mel decoder (Griffin-Lim waveform evaluation):
+# 1) Fresh latent-only Mel decoder (Griffin-Lim waveform evaluation):
 #
 # python AV_PLC/ablation_fusion.py \
 #     --dataset grid \
@@ -1036,7 +1108,8 @@ if __name__ == "__main__":
 #     --train-subset 5000 --val-subset 500 --test-subset 500 \
 #     --num-epochs 50
 #
-# 2) Joint latent+observed-phase decoder (independent training run):
+# 2) Fresh joint latent+observed-phase decoder with projected complex-spectrum
+#    consistency enabled by default (independent training run):
 #
 # python AV_PLC/ablation_fusion.py \
 #     --dataset grid \
@@ -1044,7 +1117,10 @@ if __name__ == "__main__":
 #     --phase-reconstruction \
 #     --train-subset 5000 --val-subset 500 --test-subset 500 \
 #     --num-epochs 50
-
+#
+# Add --no-phase-complex-loss to reproduce the previous phase objective without
+# the new complex-consistency term.
+#
 # The phase run requires precomputed phase data but does NOT require step 1 to
 # train. Run both only when you want the phase-vs-Griffin-Lim comparison plots.
 # Add --temporal-jitter to either command for jitter-8.

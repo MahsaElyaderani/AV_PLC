@@ -32,7 +32,8 @@ from shared.metrics import Vocoder, mel_to_audio_hifigan, torch_mel_to_audio, as
 from shared.metrics import calculate_batch_metrics, calculate_metrics
 from AV_PLC.losses import (L1Loss, SpectralConvergenceLoss, CrossEntropyLoss, WhisperASRLoss,
                            MaskedMelReconstructionLoss, UnitPhaseLoss,
-                           TemporalPhaseDifferenceLoss, FrequencyPhaseDifferenceLoss)
+                           TemporalPhaseDifferenceLoss, FrequencyPhaseDifferenceLoss,
+                           ComplexSpectrumConsistencyLoss)
 
 plt.rcParams.update({
     "text.usetex": False,
@@ -99,10 +100,12 @@ class Trainer:
         phase_unit_loss: bool = True,
         phase_temporal_loss: bool = True,
         phase_frequency_loss: bool = True,
+        phase_complex_loss: bool = True,
         w_phase_refine: float = 0.10,
         w_phase_unit: float = 0.10,
         w_phase_temporal: float = 0.05,
         w_phase_frequency: float = 0.05,
+        w_phase_complex: float = 0.10,
         phase_losses_only: bool = False,
     ):
         self.model = model
@@ -126,16 +129,19 @@ class Trainer:
         self.phase_unit_loss = bool(phase_unit_loss)
         self.phase_temporal_loss = bool(phase_temporal_loss)
         self.phase_frequency_loss = bool(phase_frequency_loss)
+        self.phase_complex_loss = bool(phase_complex_loss)
         self.w_phase_refine = float(w_phase_refine)
         self.w_phase_unit = float(w_phase_unit)
         self.w_phase_temporal = float(w_phase_temporal)
         self.w_phase_frequency = float(w_phase_frequency)
+        self.w_phase_complex = float(w_phase_complex)
         self.phase_losses_only = bool(phase_losses_only)
         if self.phase_losses_only and not self.phase_reconstruction:
             raise ValueError("phase_losses_only=True requires phase_reconstruction=True")
         if self.phase_losses_only and not (
             self.completion_mel_loss or self.phase_unit_loss or
-            self.phase_temporal_loss or self.phase_frequency_loss
+            self.phase_temporal_loss or self.phase_frequency_loss or
+            self.phase_complex_loss
         ):
             raise ValueError("phase_losses_only=True requires at least one completion/phase loss")
         if self.phase_reconstruction and not getattr(model, 'phase_reconstruction', False):
@@ -234,10 +240,15 @@ class Trainer:
             self.phase_unit_criterion = UnitPhaseLoss().to(self.device)
             self.phase_temporal_criterion = TemporalPhaseDifferenceLoss().to(self.device)
             self.phase_frequency_criterion = FrequencyPhaseDifferenceLoss().to(self.device)
+            self.phase_complex_criterion = (
+                ComplexSpectrumConsistencyLoss().to(self.device)
+                if self.phase_complex_loss else None
+            )
         else:
             self.phase_unit_criterion = None
             self.phase_temporal_criterion = None
             self.phase_frequency_criterion = None
+            self.phase_complex_criterion = None
         # Deprecated attribute kept so external inspection does not fail.
         self.phase_refine_criterion = self.completion_mel_criterion
 
@@ -467,7 +478,12 @@ class Trainer:
             prediction_mask = None
             parts["completion_mel_loss"] = spec.new_tensor(0.0)
 
-        phase_keys = ("phase_unit_loss", "phase_temporal_loss", "phase_frequency_loss")
+        phase_keys = (
+            "phase_unit_loss",
+            "phase_temporal_loss",
+            "phase_frequency_loss",
+            "phase_complex_loss",
+        )
         if self.phase_reconstruction:
             if completion_output is None or phase is None:
                 raise ValueError(
@@ -516,6 +532,37 @@ class Trainer:
                 phase_weighted_loss = phase_weighted_loss + weighted
             else:
                 parts["phase_frequency_loss"] = spec.new_tensor(0.0)
+
+            # Couple the predicted Mel magnitude and predicted phase in the same
+            # 257-bin linear-frequency domain.  This is a projected complex-STFT
+            # consistency objective because the magnitude is obtained through the
+            # fixed pseudo-inverse Mel mapping already used elsewhere in AV_PLC.
+            if self.phase_complex_loss and self.phase_complex_criterion is not None:
+                with torch.amp.autocast('cuda', enabled=False):
+                    pred_power = mel_to_power_linear(
+                        completion_output["predicted_mel"].float(), self.mel_pinv
+                    )
+                    target_power = mel_to_power_linear(
+                        target_mel.float(), self.mel_pinv
+                    )
+                    pred_mag = torch.sqrt(pred_power.clamp_min(1e-8))
+                    target_mag = torch.sqrt(target_power.clamp_min(1e-8))
+
+                    value = self.phase_complex_criterion(
+                        pred_mag=pred_mag,
+                        pred_cos=completion_output["pred_cos"].float(),
+                        pred_sin=completion_output["pred_sin"].float(),
+                        target_mag=target_mag,
+                        target_phase=target_phase.float(),
+                        prediction_mask=prediction_mask.float(),
+                    )
+
+                parts["phase_complex_loss"] = value
+                weighted = self.w_phase_complex * value
+                loss = loss + weighted
+                phase_weighted_loss = phase_weighted_loss + weighted
+            else:
+                parts["phase_complex_loss"] = spec.new_tensor(0.0)
         else:
             for key in phase_keys:
                 parts[key] = spec.new_tensor(0.0)
@@ -752,6 +799,7 @@ class Trainer:
             'phase_unit_loss',
             'phase_temporal_loss',
             'phase_frequency_loss',
+            'phase_complex_loss',
         ]:
             v = loss_components.get(k, None)
             if v is not None:

@@ -503,11 +503,20 @@ def estimate_frame_rotation(pred_cos, pred_sin, target_phase, gt_mag, prediction
     mag = gt_mag.float().clamp_min(0.0)
 
     dot, cross = error_phasor(pred_cos, pred_sin, target_cos, target_sin)
-    wsum = mag.sum(dim=1).clamp_min(EPS)
+
+    # A frame with zero (or numerically negligible) GT STFT magnitude has no
+    # physically meaningful target phase orientation.  Do NOT manufacture a
+    # rotation estimate by dividing 0 by eps: mark such frames invalid for the
+    # rotation statistics and leave their learned phase unchanged in G.
+    raw_wsum = mag.sum(dim=1)
+    valid_energy = raw_wsum > EPS
+    wsum = raw_wsum.clamp_min(EPS)
     mean_c = (mag * dot).sum(dim=1) / wsum
     mean_s = (mag * cross).sum(dim=1) / wsum
-    R = torch.sqrt(mean_c.square() + mean_s.square()).clamp(0.0, 1.0)
-    alpha = torch.atan2(mean_s, mean_c)
+    R_raw = torch.sqrt(mean_c.square() + mean_s.square()).clamp(0.0, 1.0)
+    alpha_raw = torch.atan2(mean_s, mean_c)
+    R = torch.where(valid_energy, R_raw, torch.full_like(R_raw, float("nan")))
+    alpha = torch.where(valid_energy, alpha_raw, torch.zeros_like(alpha_raw))
 
     frame_peak = mag.amax(dim=1, keepdim=True).clamp_min(EPS)
     threshold = frame_peak * (10.0 ** (HIGH_ENERGY_DB / 20.0))
@@ -520,28 +529,53 @@ def estimate_frame_rotation(pred_cos, pred_sin, target_phase, gt_mag, prediction
     R_high = torch.where(high_wsum > EPS, R_high, torch.full_like(R_high, float("nan")))
     high_count = high_mask.sum(dim=1)
 
-    # Weighted unit circular loss before correction is exactly 1-mean_c.
-    circ_before = 1.0 - mean_c
-    # The optimal common rotation changes mean_c to R; its minimum circular loss is 1-R.
-    circ_after_opt = 1.0 - R
+    # Weighted unit circular loss before correction is exactly 1-mean_c on
+    # frames where phase is defined.  Silent/zero-energy frames are NaN here so
+    # they cannot bias concentration/error summaries.
+    circ_before_raw = 1.0 - mean_c
+    circ_before = torch.where(
+        valid_energy, circ_before_raw, torch.full_like(circ_before_raw, float("nan"))
+    )
+    # The optimal common rotation changes mean_c to R_raw; its minimum circular
+    # loss is 1-R_raw.
+    circ_after_opt_raw = 1.0 - R_raw
 
     angle_before = circular_abs_from_phasor(dot, cross)
-    angle_before_w = (mag * angle_before).sum(dim=1) / wsum
+    angle_before_w_raw = (mag * angle_before).sum(dim=1) / wsum
+    angle_before_w = torch.where(
+        valid_energy, angle_before_w_raw, torch.full_like(angle_before_w_raw, float("nan"))
+    )
 
-    # alpha is only meaningful on missing frames.  Set observed frames to zero so
-    # corrected FINAL phase remains unchanged outside the gap and delta-alpha
-    # naturally includes the observed/missing boundaries.
+    # alpha is meaningful only on missing frames with non-negligible GT energy.
+    # Observed frames and silent missing frames get alpha=0, so G leaves them
+    # unchanged.  This is scientifically preferable to imposing an arbitrary
+    # oracle rotation where GT phase itself is undefined/irrelevant.
     missing = prediction_mask > 0.5
-    alpha_for_correction = torch.where(missing, alpha, torch.zeros_like(alpha))
+    missing_valid = missing & valid_energy
+    alpha_for_correction = torch.where(
+        missing_valid, alpha_raw, torch.zeros_like(alpha_raw)
+    )
 
     corr_cos, corr_sin = rotate_by_minus_alpha(pred_cos, pred_sin, alpha_for_correction)
     dot2, cross2 = error_phasor(corr_cos, corr_sin, target_cos, target_sin)
     angle_after = circular_abs_from_phasor(dot2, cross2)
-    circ_after = (mag * (1.0 - dot2)).sum(dim=1) / wsum
-    angle_after_w = (mag * angle_after).sum(dim=1) / wsum
+    circ_after_raw = (mag * (1.0 - dot2)).sum(dim=1) / wsum
+    angle_after_w_raw = (mag * angle_after).sum(dim=1) / wsum
+    circ_after = torch.where(
+        valid_energy, circ_after_raw, torch.full_like(circ_after_raw, float("nan"))
+    )
+    angle_after_w = torch.where(
+        valid_energy, angle_after_w_raw, torch.full_like(angle_after_w_raw, float("nan"))
+    )
 
-    # This equality is a useful internal check on the circular-mean math.
-    max_formula_err = ((circ_after - circ_after_opt).abs() * missing).max().item()
+    # This equality is a useful internal check on the circular-mean math, but it
+    # is mathematically defined only when the frame has non-zero spectral weight.
+    if missing_valid.any():
+        max_formula_err = (
+            circ_after_raw[missing_valid] - circ_after_opt_raw[missing_valid]
+        ).abs().max().item()
+    else:
+        max_formula_err = 0.0
     if max_formula_err > 2e-5:
         raise RuntimeError(
             "Frame-rotation math self-consistency failed: "
@@ -550,6 +584,7 @@ def estimate_frame_rotation(pred_cos, pred_sin, target_phase, gt_mag, prediction
 
     return {
         "alpha": alpha_for_correction,
+        "valid_energy": valid_energy,
         "R": R,
         "R_high": R_high,
         "high_count": high_count,
@@ -715,6 +750,30 @@ class RotationCollector:
             depth = 2.0 * torch.minimum(pos, 1.0 - pos)
 
             for k, t in enumerate(idx.tolist()):
+                valid_energy = bool(rot["valid_energy"][b, t].item())
+                mag_sum = float(gt_mag[b, :, t].sum().item())
+                vals = self.frame_values[key]
+                vals["energy_valid_flag"].append(1.0 if valid_energy else 0.0)
+                vals["frame_mag_sum_all"].append(mag_sum)
+
+                # When GT magnitude is zero, phase orientation is undefined.
+                # Keep a record of its occurrence, but exclude it from all alpha/R
+                # and phase-error statistics so silence cannot masquerade as either
+                # strong or weak evidence for common rotation.
+                if not valid_energy:
+                    if self.save_details:
+                        self.frame_rows.append({
+                            "method": method,
+                            "gap_ms": int(gap),
+                            "path": str(path[b]),
+                            "frame_index": int(t),
+                            "gap_position": float(pos[k].item()),
+                            "gap_depth": float(depth[k].item()),
+                            "valid_energy_frame": False,
+                            "gt_magnitude_sum": mag_sum,
+                        })
+                    continue
+
                 alpha = float(rot["alpha"][b, t].item())
                 Rv = float(rot["R"][b, t].item())
                 Rh = float(rot["R_high"][b, t].item())
@@ -723,9 +782,7 @@ class RotationCollector:
                 before_a = float(rot["angle_before_w"][b, t].item())
                 after_a = float(rot["angle_after_w"][b, t].item())
                 reduction = (before_c - after_c) / max(before_c, EPS)
-                mag_sum = float(gt_mag[b, :, t].sum().item())
 
-                vals = self.frame_values[key]
                 vals["alpha_abs_deg"].append(abs(alpha) * 180.0 / math.pi)
                 vals["R"].append(Rv)
                 vals["R_high"].append(Rh)
@@ -744,6 +801,7 @@ class RotationCollector:
                         "frame_index": int(t),
                         "gap_position": float(pos[k].item()),
                         "gap_depth": float(depth[k].item()),
+                        "valid_energy_frame": True,
                         "alpha_rad": alpha,
                         "alpha_deg": alpha * 180.0 / math.pi,
                         "alpha_abs_deg": abs(alpha) * 180.0 / math.pi,
@@ -785,17 +843,30 @@ class RotationCollector:
 
         pair_mask = torch.maximum(prediction_mask[:, :-1], prediction_mask[:, 1:]) > 0.5
         pair_mag = 0.5 * (gt_mag[..., :-1] + gt_mag[..., 1:])
-        wsum = pair_mag.sum(dim=1).clamp_min(EPS)
+        raw_wsum = pair_mag.sum(dim=1)
+        valid_pair_energy = raw_wsum > EPS
+        wsum = raw_wsum.clamp_min(EPS)
 
         mean_c = (pair_mag * dot).sum(dim=1) / wsum
         mean_s = (pair_mag * cross).sum(dim=1) / wsum
-        R_tem = torch.sqrt(mean_c.square() + mean_s.square()).clamp(0, 1)
-        beta = torch.atan2(mean_s, mean_c)  # best common temporal error across frequency
+        R_tem_raw = torch.sqrt(mean_c.square() + mean_s.square()).clamp(0, 1)
+        beta_raw = torch.atan2(mean_s, mean_c)  # best common temporal error across frequency
+        R_tem = torch.where(
+            valid_pair_energy, R_tem_raw, torch.full_like(R_tem_raw, float("nan"))
+        )
+        beta = torch.where(valid_pair_energy, beta_raw, torch.zeros_like(beta_raw))
 
         mean_c_after = (pair_mag * cdot).sum(dim=1) / wsum
         mean_s_after = (pair_mag * ccross).sum(dim=1) / wsum
-        R_tem_after = torch.sqrt(mean_c_after.square() + mean_s_after.square()).clamp(0, 1)
-        beta_after = torch.atan2(mean_s_after, mean_c_after)
+        R_tem_after_raw = torch.sqrt(mean_c_after.square() + mean_s_after.square()).clamp(0, 1)
+        beta_after_raw = torch.atan2(mean_s_after, mean_c_after)
+        R_tem_after = torch.where(
+            valid_pair_energy, R_tem_after_raw,
+            torch.full_like(R_tem_after_raw, float("nan"))
+        )
+        beta_after = torch.where(
+            valid_pair_energy, beta_after_raw, torch.zeros_like(beta_after_raw)
+        )
 
         # Because alpha=0 on observed frames, this includes left/right gap boundaries.
         delta_alpha = torch.atan2(
@@ -815,6 +886,21 @@ class RotationCollector:
                     else "left_boundary"
                 )
                 vals = self.temporal_values[key]
+                pair_valid = bool(valid_pair_energy[b, t].item())
+                vals["energy_valid_pair_flag"].append(1.0 if pair_valid else 0.0)
+                if not pair_valid:
+                    if self.save_details:
+                        self.temporal_rows.append({
+                            "method": method,
+                            "gap_ms": int(gap),
+                            "path": str(path[b]),
+                            "left_frame": int(t),
+                            "right_frame": int(t + 1),
+                            "transition_type": kind,
+                            "valid_energy_pair": False,
+                        })
+                    continue
+
                 vals["R_temporal"].append(float(R_tem[b, t].item()))
                 vals["R_temporal_after"].append(float(R_tem_after[b, t].item()))
                 vals["beta_abs_deg"].append(abs(float(beta[b, t].item())) * 180.0 / math.pi)
@@ -831,6 +917,7 @@ class RotationCollector:
                         "left_frame": int(t),
                         "right_frame": int(t + 1),
                         "transition_type": kind,
+                        "valid_energy_pair": True,
                         "alpha_left_deg": float(alpha[b, t].item()) * 180.0 / math.pi,
                         "alpha_right_deg": float(alpha[b, t + 1].item()) * 180.0 / math.pi,
                         "delta_alpha_deg": float(delta_alpha[b, t].item()) * 180.0 / math.pi,
