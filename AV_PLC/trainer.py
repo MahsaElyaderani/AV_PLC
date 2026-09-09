@@ -31,7 +31,7 @@ from evaluations.runtime_config import DATA_ROOT
 from shared.metrics import Vocoder, mel_to_audio_hifigan, torch_mel_to_audio, asr_transcribe_np
 from shared.metrics import calculate_batch_metrics, calculate_metrics
 from AV_PLC.losses import (L1Loss, SpectralConvergenceLoss, CrossEntropyLoss, WhisperASRLoss,
-                           MelRefinementLoss, UnitPhaseLoss,
+                           MaskedMelReconstructionLoss, UnitPhaseLoss,
                            TemporalPhaseDifferenceLoss, FrequencyPhaseDifferenceLoss)
 
 plt.rcParams.update({
@@ -93,6 +93,8 @@ class Trainer:
         betas=(0.9, 0.98),
         early_stop_patience: int | None = 10,
         phase_reconstruction: bool = False,
+        completion_mel_loss: bool = True,
+        w_completion_mel: float = 1.0,
         phase_refine_loss: bool = True,
         phase_unit_loss: bool = True,
         phase_temporal_loss: bool = True,
@@ -115,6 +117,11 @@ class Trainer:
         self.asr_loss = bool(asr_loss)
         self.enc_loss = bool(enc_loss)
         self.phase_reconstruction = bool(phase_reconstruction)
+        self.completion_mel_loss = bool(completion_mel_loss)
+        self.w_completion_mel = float(w_completion_mel)
+        # phase_refine_loss/w_phase_refine are retained only as API compatibility
+        # aliases from the old post-Mel residual design.  The new decoder always
+        # uses the explicit completion_mel_loss below.
         self.phase_refine_loss = bool(phase_refine_loss)
         self.phase_unit_loss = bool(phase_unit_loss)
         self.phase_temporal_loss = bool(phase_temporal_loss)
@@ -126,11 +133,11 @@ class Trainer:
         self.phase_losses_only = bool(phase_losses_only)
         if self.phase_losses_only and not self.phase_reconstruction:
             raise ValueError("phase_losses_only=True requires phase_reconstruction=True")
-        if self.phase_losses_only and not any((
-            self.phase_refine_loss, self.phase_unit_loss,
-            self.phase_temporal_loss, self.phase_frequency_loss,
-        )):
-            raise ValueError("phase_losses_only=True requires at least one enabled phase loss")
+        if self.phase_losses_only and not (
+            self.completion_mel_loss or self.phase_unit_loss or
+            self.phase_temporal_loss or self.phase_frequency_loss
+        ):
+            raise ValueError("phase_losses_only=True requires at least one completion/phase loss")
         if self.phase_reconstruction and not getattr(model, 'phase_reconstruction', False):
             raise ValueError('Trainer phase_reconstruction=True requires an AV_PLC model with phase_reconstruction=True')
 
@@ -219,16 +226,20 @@ class Trainer:
         else:
             self.asr_criterion = None
 
+        self.completion_mel_criterion = (
+            MaskedMelReconstructionLoss().to(self.device)
+            if self.completion_mel_loss else None
+        )
         if self.phase_reconstruction:
-            self.phase_refine_criterion = MelRefinementLoss().to(self.device)
             self.phase_unit_criterion = UnitPhaseLoss().to(self.device)
             self.phase_temporal_criterion = TemporalPhaseDifferenceLoss().to(self.device)
             self.phase_frequency_criterion = FrequencyPhaseDifferenceLoss().to(self.device)
         else:
-            self.phase_refine_criterion = None
             self.phase_unit_criterion = None
             self.phase_temporal_criterion = None
             self.phase_frequency_criterion = None
+        # Deprecated attribute kept so external inspection does not fail.
+        self.phase_refine_criterion = self.completion_mel_criterion
 
         # vocoder
         self.vocoder = Vocoder(self.vocoder_path) if self.vocoder_path is not None else None
@@ -241,8 +252,11 @@ class Trainer:
 
         # optimizer + scheduler
         # trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise ValueError("Model has no trainable parameters")
         self.optimizer = optim.AdamW(
-            self.model.parameters(), #trainable_params
+            trainable_params,
             lr=self.learning_rate,
             weight_decay=weight_decay,
             betas=betas
@@ -358,7 +372,7 @@ class Trainer:
                       video_aligned_spec=None, phase_output=None,
                       phase=None, video_aligned_phase=None):
 
-        loss = 0.0
+        loss = spec.new_tensor(0.0)
         parts = {}
 
         if avail is None:
@@ -366,26 +380,33 @@ class Trainer:
             avail = torch.ones(B, 2, dtype=torch.bool, device=spec.device)
 
         both = avail[:, 0] & avail[:, 1]
-        a_on = avail[:, 0]  # both + only_a
-        v_on = avail[:, 1]  # both + only_v
+        a_on = avail[:, 0]
+        v_on = avail[:, 1]
         only_v = (~a_on) & v_on
 
-        _supervise_enc = self.enc_loss or (fused_spec is None)
-        if self.drop_av and not self.enc_loss:
-            raise ValueError(
-                "Modality dropout requires enc_loss=True, otherwise "
-                "single-modality samples may receive no supervision."
-            )
+        # The unified decoder output is carried in phase_output for API
+        # compatibility even when learned phase is disabled.  In the new
+        # architecture it is the primary reconstruction path for AV/audio/video.
+        completion_output = phase_output
 
-        # --- fused L1: only on "both" modality samples ---
-        if fused_spec is not None and both.any():
+        # Legacy fused L1 is used only for models that do not expose the unified
+        # completion output.  Counting it as well would duplicate Mel supervision.
+        if completion_output is None and fused_spec is not None and both.any():
             fused_loss = self.rec_criterion(fused_spec[both], spec[both])
             parts['fused_loss'] = fused_loss
             loss = loss + fused_loss
         else:
-            parts['fused_loss'] = None
+            parts['fused_loss'] = spec.new_tensor(0.0)
 
-        # --- audio encoder L1 ---
+        # Encoder Mel heads are auxiliary only.  They are not inputs to the
+        # latent-only spectral decoder.
+        _supervise_enc = self.enc_loss or (completion_output is None and fused_spec is None)
+        if self.drop_av and not self.enc_loss and completion_output is None:
+            raise ValueError(
+                "Modality dropout requires either unified completion supervision "
+                "or enc_loss=True."
+            )
+
         if _supervise_enc and rec_spec is not None and a_on.any():
             rec_loss = self.rec_criterion(rec_spec[a_on], spec[a_on])
             parts['rec_loss'] = rec_loss
@@ -394,14 +415,13 @@ class Trainer:
         else:
             parts['rec_loss'] = spec.new_tensor(0.0)
 
-        # --- video/synthesis head losses ---
         if _supervise_enc and synth_spec is not None and v_on.any():
             synth_w = 0.1 if fused_spec is not None else 1.0
             synth_pred = synth_spec[v_on]
             target_all = video_aligned_spec if video_aligned_spec is not None else spec
             synth_target = target_all[v_on]
 
-            synth_loss = self.rec_criterion(synth_pred, synth_target,)
+            synth_loss = self.rec_criterion(synth_pred, synth_target)
             parts["synth_loss"] = synth_loss
             loss = loss + synth_w * synth_loss
 
@@ -423,73 +443,88 @@ class Trainer:
             parts["synth_sc_loss"] = spec.new_tensor(0.0)
             parts["synth_ce_loss"] = spec.new_tensor(0.0)
 
-        # --- Optional shared post-Mel completion losses ---
+        completion_weighted_loss = spec.new_tensor(0.0)
         phase_weighted_loss = spec.new_tensor(0.0)
-        phase_keys = ("phase_refine_loss", "phase_unit_loss",
-                      "phase_temporal_loss", "phase_frequency_loss")
-        if self.phase_reconstruction:
-            if phase_output is None or phase is None:
-                raise ValueError("Phase reconstruction is enabled but phase outputs/targets are missing")
 
-            target_mel = spec
-            target_phase = phase
-            if only_v.any():
-                # Jittered video-only predictions live on the jittered visual timeline.
-                if video_aligned_spec is not None:
-                    target_mel = spec.clone()
-                    target_mel[only_v] = video_aligned_spec[only_v]
-                if video_aligned_phase is not None:
-                    target_phase = phase.clone()
-                    target_phase[only_v] = video_aligned_phase[only_v]
+        target_mel = spec
+        if only_v.any() and video_aligned_spec is not None:
+            target_mel = spec.clone()
+            target_mel[only_v] = video_aligned_spec[only_v]
 
-            prediction_mask = phase_output["prediction_mask"].to(spec.dtype)
-
-            if self.phase_refine_loss and self.phase_refine_criterion is not None:
-                value = self.phase_refine_criterion(phase_output["refined_mel"],
-                                                    target_mel, prediction_mask)
-                parts["phase_refine_loss"] = value
-                loss = loss + self.w_phase_refine * value
-                phase_weighted_loss = phase_weighted_loss + self.w_phase_refine * value
+        if completion_output is not None:
+            prediction_mask = completion_output["prediction_mask"].to(spec.dtype)
+            if self.completion_mel_loss and self.completion_mel_criterion is not None:
+                value = self.completion_mel_criterion(
+                    completion_output["predicted_mel"], target_mel, prediction_mask
+                )
+                parts["completion_mel_loss"] = value
+                weighted = self.w_completion_mel * value
+                loss = loss + weighted
+                completion_weighted_loss = completion_weighted_loss + weighted
             else:
-                parts["phase_refine_loss"] = spec.new_tensor(0.0)
+                parts["completion_mel_loss"] = spec.new_tensor(0.0)
+        else:
+            prediction_mask = None
+            parts["completion_mel_loss"] = spec.new_tensor(0.0)
+
+        phase_keys = ("phase_unit_loss", "phase_temporal_loss", "phase_frequency_loss")
+        if self.phase_reconstruction:
+            if completion_output is None or phase is None:
+                raise ValueError(
+                    "Phase reconstruction is enabled but completion outputs/phase targets are missing"
+                )
+            if completion_output.get("pred_cos") is None:
+                raise ValueError("Phase reconstruction is enabled but predicted phase is missing")
+
+            target_phase = phase
+            if only_v.any() and video_aligned_phase is not None:
+                target_phase = phase.clone()
+                target_phase[only_v] = video_aligned_phase[only_v]
 
             if self.phase_unit_loss and self.phase_unit_criterion is not None:
                 value = self.phase_unit_criterion(
-                    phase_output["pred_cos"], phase_output["pred_sin"],
+                    completion_output["pred_cos"], completion_output["pred_sin"],
                     target_phase, prediction_mask
                 )
                 parts["phase_unit_loss"] = value
-                loss = loss + self.w_phase_unit * value
-                phase_weighted_loss = phase_weighted_loss + self.w_phase_unit * value
+                weighted = self.w_phase_unit * value
+                loss = loss + weighted
+                phase_weighted_loss = phase_weighted_loss + weighted
             else:
                 parts["phase_unit_loss"] = spec.new_tensor(0.0)
 
             if self.phase_temporal_loss and self.phase_temporal_criterion is not None:
                 value = self.phase_temporal_criterion(
-                    phase_output["final_cos"], phase_output["final_sin"],
+                    completion_output["final_cos"], completion_output["final_sin"],
                     target_phase, prediction_mask
                 )
                 parts["phase_temporal_loss"] = value
-                loss = loss + self.w_phase_temporal * value
-                phase_weighted_loss = phase_weighted_loss + self.w_phase_temporal * value
+                weighted = self.w_phase_temporal * value
+                loss = loss + weighted
+                phase_weighted_loss = phase_weighted_loss + weighted
             else:
                 parts["phase_temporal_loss"] = spec.new_tensor(0.0)
 
             if self.phase_frequency_loss and self.phase_frequency_criterion is not None:
                 value = self.phase_frequency_criterion(
-                    phase_output["final_cos"], phase_output["final_sin"],
+                    completion_output["final_cos"], completion_output["final_sin"],
                     target_phase, prediction_mask
                 )
                 parts["phase_frequency_loss"] = value
-                loss = loss + self.w_phase_frequency * value
-                phase_weighted_loss = phase_weighted_loss + self.w_phase_frequency * value
+                weighted = self.w_phase_frequency * value
+                loss = loss + weighted
+                phase_weighted_loss = phase_weighted_loss + weighted
             else:
                 parts["phase_frequency_loss"] = spec.new_tensor(0.0)
         else:
             for key in phase_keys:
                 parts[key] = spec.new_tensor(0.0)
 
-        # --- Perceptual losses: fused on "both" only (legacy behavior) ---
+        # Preserve the old key in logs as a zero-valued compatibility field.
+        parts["phase_refine_loss"] = spec.new_tensor(0.0)
+
+        # Perceptual losses remain AV-only.  fused_spec now contains the unified
+        # decoder prediction for AV samples, so existing behavior remains valid.
         groups = [('fused', fused_spec, both, 1.0)]
         pmsqe_accum = spec.new_tensor(0.0)
         asr_accum = spec.new_tensor(0.0)
@@ -499,18 +534,14 @@ class Trainer:
             for _, head_output, idx, w in groups:
                 if head_output is None or not idx.any():
                     continue
-
                 p = head_output[idx].float()
                 r = spec[idx].float()
-
                 if self.pesq_loss and self.pmsqe is not None:
                     pow_ref = mel_to_power_linear(r, self.mel_pinv).permute(0, 2, 1).contiguous()
                     pow_est = mel_to_power_linear(p, self.mel_pinv).permute(0, 2, 1).contiguous()
                     pmsqe_accum = pmsqe_accum + w * torch.mean(self.pmsqe(pow_est, pow_ref))
-
                 if self.asr_loss and self.asr_criterion is not None:
                     asr_accum = asr_accum + w * self.asr_criterion(r, p)
-
                 w_total += w
 
         if w_total > 0:
@@ -520,7 +551,6 @@ class Trainer:
                 loss = loss + self.w_pmsqe * pmsqe_loss
             else:
                 parts['pmsqe_loss'] = None
-
             if self.asr_loss and self.asr_criterion is not None:
                 asr_loss = asr_accum / w_total
                 parts['asr_loss'] = asr_loss
@@ -528,13 +558,14 @@ class Trainer:
             else:
                 parts['asr_loss'] = None
 
-        if self.phase_reconstruction and self.phase_losses_only:
-            # Used by the frozen-legacy phase ablation so checkpoint selection is
-            # driven only by objectives that can update the new completion head.
-            loss = phase_weighted_loss
+        if self.phase_losses_only:
+            # Compatibility mode: exclude auxiliary encoder/perceptual objectives,
+            # but never discard the primary Mel reconstruction objective.
+            loss = completion_weighted_loss + phase_weighted_loss
 
         parts['loss'] = loss
         return loss, parts
+
     # ---------------------------------------- train epoch ---------------------------------------
     def _train_epoch(self, epoch, num_epochs):
 
@@ -637,14 +668,14 @@ class Trainer:
                     acc_parts[k].append(v.item())
 
             res = fused_spec if fused_spec is not None else rec_spec if rec_spec is not None else synth_spec
-            metric_res = phase_output["refined_mel"] if phase_output is not None else res
+            metric_res = phase_output["predicted_mel"] if phase_output is not None else res
             remaining = target_metric_samples - n_collected
             if remaining > 0 and metric_res is not None:
                 take = min(remaining, spec.shape[0])
 
                 specs_accum.append(spec[:take].detach().cpu())
                 res_accum.append(metric_res[:take].detach().cpu())
-                if phase_output is not None:
+                if phase_output is not None and phase_output.get("final_cos") is not None:
                     phase_audio = torch_melphase2audio(
                         phase_output["completed_mel"][:take].float(),
                         phase_output["final_cos"][:take].float(),
@@ -716,6 +747,7 @@ class Trainer:
             'pmsqe_loss',
             'stoi_loss',
             'asr_loss',
+            'completion_mel_loss',
             'phase_refine_loss',
             'phase_unit_loss',
             'phase_temporal_loss',
@@ -794,7 +826,7 @@ class Trainer:
                                                          audio_length, avail, audio_mask=mask, phase=phase)
 
         if phase_output is not None:
-            fused_spec = phase_output["refined_mel"][:num_samples]
+            fused_spec = phase_output["predicted_mel"][:num_samples]
         elif fused_spec is not None:
             fused_spec = fused_spec[:num_samples]
 
@@ -1242,9 +1274,9 @@ class Trainer:
             head_spec = rec_spec if self.mode == "a" else synth_spec if self.mode == "v" else fused_spec
             if head_spec is None:
                 raise RuntimeError(f"No evaluation output for mode={self.mode}")
-            metric_head_spec = phase_output["refined_mel"] if phase_output is not None else head_spec
+            metric_head_spec = phase_output["predicted_mel"] if phase_output is not None else head_spec
             phase_audio = None
-            if phase_output is not None:
+            if phase_output is not None and phase_output.get("final_cos") is not None:
                 phase_audio = torch_melphase2audio(
                     phase_output["completed_mel"].float(),
                     phase_output["final_cos"].float(),
@@ -1394,9 +1426,9 @@ class Trainer:
                     fused_spec, rec_spec, synth_spec, phase_output = self._forward(visual_feats, spk_emb,
                                                                      masked_spec, audio_length,
                                                                      avail, audio_mask=mask, phase=phase)
-                    metric_spec = phase_output["refined_mel"] if phase_output is not None else fused_spec
+                    metric_spec = phase_output["predicted_mel"] if phase_output is not None else fused_spec
                     phase_audio_batch = None
-                    if phase_output is not None:
+                    if phase_output is not None and phase_output.get("final_cos") is not None:
                         mel_mean, mel_std = self._get_dataset_stats(test_loader)
                         phase_audio_batch = torch_melphase2audio(
                             phase_output["completed_mel"].float(),
@@ -1546,9 +1578,9 @@ class Trainer:
                 )
                 if primary_spec is None:
                     continue
-                metric_spec = phase_output["refined_mel"] if phase_output is not None else primary_spec
+                metric_spec = phase_output["predicted_mel"] if phase_output is not None else primary_spec
                 phase_audio = None
-                if phase_output is not None:
+                if phase_output is not None and phase_output.get("final_cos") is not None:
                     phase_audio = torch_melphase2audio(
                         phase_output["completed_mel"].float(),
                         phase_output["final_cos"].float(),
@@ -1644,7 +1676,7 @@ class Trainer:
                 sample_plot_dir = os.path.join(plot_dir, sample_key)
                 os.makedirs(sample_plot_dir, exist_ok=True)
                 plot_fused = (
-                    phase_output["refined_mel"][i:i + 1]
+                    phase_output["predicted_mel"][i:i + 1]
                     if phase_output is not None else
                     fused_spec[i:i + 1] if fused_spec is not None else None
                 )
@@ -1659,7 +1691,7 @@ class Trainer:
             orig_raw, masked_raw = read_gt_input(video_path, mask[i])
             orig_f32 = _to_float(orig_raw)
             masked_f32 = _to_float(masked_raw if masked_spec is not None else None)
-            if phase_output is not None:
+            if phase_output is not None and phase_output.get("final_cos") is not None:
                 fused_phase_audio = torch_melphase2audio(
                     phase_output["completed_mel"][i].float(),
                     phase_output["final_cos"][i].float(),
@@ -1667,6 +1699,8 @@ class Trainer:
                     mel_mean=mel_mean, mel_std=mel_std,
                 )
                 fused_raw = _to_float(fused_phase_audio.detach().cpu().numpy())
+            elif phase_output is not None:
+                fused_raw = _head_audio(phase_output["completed_mel"], i)
             else:
                 fused_raw = _head_audio(fused_spec, i)
             rec_raw = _head_audio(rec_spec, i)
@@ -1678,7 +1712,7 @@ class Trainer:
             synth_f32 = (self._insert_reconstructed_gap(orig_f32, synth_raw, mask[i])
                          if synth_raw is not None else None)
 
-            fused_source = (phase_output["refined_mel"] if phase_output is not None else fused_spec)
+            fused_source = (phase_output["predicted_mel"] if phase_output is not None else fused_spec)
             fused_pred = (fused_source[i].detach().cpu().numpy().astype("float32")
                           if fused_source is not None else np.array([], dtype=np.float32))
             rec_pred = (rec_spec[i].detach().cpu().numpy().astype("float32")
@@ -1711,9 +1745,11 @@ class Trainer:
                     phase_completed_spec=(phase_output["completed_mel"][i].detach().cpu().numpy().astype("float32")
                                           if phase_output is not None else np.array([], dtype=np.float32)),
                     phase_final_cos=(phase_output["final_cos"][i].detach().cpu().numpy().astype("float32")
-                                     if phase_output is not None else np.array([], dtype=np.float32)),
+                                     if phase_output is not None and phase_output.get("final_cos") is not None
+                                     else np.array([], dtype=np.float32)),
                     phase_final_sin=(phase_output["final_sin"][i].detach().cpu().numpy().astype("float32")
-                                     if phase_output is not None else np.array([], dtype=np.float32)),
+                                     if phase_output is not None and phase_output.get("final_sin") is not None
+                                     else np.array([], dtype=np.float32)),
                     fused_merged_spec=fused_merged,
                     audio_merged_spec=rec_merged,
                     video_merged_spec=synth_merged,
